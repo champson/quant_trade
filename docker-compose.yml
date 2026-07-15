@@ -1,0 +1,24 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+      - ./runs:/app/runs
+    ports:
+      - "127.0.0.1:8501:8501"
+
+  daily:
+    build: .
+    profiles: [manual]
+    env_file: .env
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+      - ./runs:/app/runs
+    command: ["qt", "daily", "run"]
+

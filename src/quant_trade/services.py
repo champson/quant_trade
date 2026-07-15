@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+from datetime import date
+
+import pandas as pd
+
+from quant_trade.backtest import ExecutionConfig, run_weight_backtest
+from quant_trade.config import AppConfig
+from quant_trade.data.router import DataRouter
+from quant_trade.data.storage import DataStore
+from quant_trade.models import AssetType, DataRequest, Dataset, Frequency
+from quant_trade.strategies import get_strategy
+
+
+def update_bars(
+    config: AppConfig,
+    router: DataRouter,
+    store: DataStore,
+    symbols: list[str],
+    start: date,
+    end: date,
+    asset_type: AssetType,
+    provider: str = "auto",
+    adjustment: str = "none",
+    resume: bool = True,
+) -> pd.DataFrame:
+    groups = [[symbol] for symbol in symbols] if symbols else [[]]
+    frames: list[pd.DataFrame] = []
+    for group in groups:
+        fetch_start = start
+        if resume and not group and start == end and store.market_snapshot_complete(asset_type.value, end):
+            continue
+        if resume and group:
+            cached = store.read_daily(group, str(start), str(end))
+            if not cached.empty:
+                last = cached["trade_date"].max().date()
+                if last >= end:
+                    continue
+                fetch_start = max(start, last + pd.Timedelta(days=1))
+        batch = router.fetch(DataRequest(
+            dataset=Dataset.BARS, symbols=tuple(group), start=fetch_start, end=end,
+            frequency=Frequency.DAY, asset_type=asset_type, provider=provider,
+            adjustment=adjustment,
+        ))
+        store.write_daily(batch.data, asset_type.value)
+        if not group and start == end:
+            store.mark_market_snapshot(asset_type.value, end)
+        frames.append(batch.data)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def update_daily_basic(
+    router: DataRouter, store: DataStore, trade_date: date, provider: str = "auto",
+) -> pd.DataFrame:
+    batch = router.fetch(DataRequest(
+        dataset=Dataset.DAILY_BASIC, start=trade_date, end=trade_date, provider=provider,
+    ))
+    store.write_daily_basic(batch.data)
+    return batch.data
+
+
+def strategy_bars(store: DataStore, symbols: list[str], start: str | None, end: str | None) -> pd.DataFrame:
+    if symbols:
+        data = store.read_daily(symbols, start, end)
+    else:
+        paths = list((store.root / "daily" / AssetType.STOCK.value).glob("*.parquet"))
+        data = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True) if paths else pd.DataFrame()
+        if not data.empty:
+            data["trade_date"] = pd.to_datetime(data["trade_date"])
+            if start:
+                data = data[data["trade_date"] >= pd.Timestamp(start)]
+            if end:
+                data = data[data["trade_date"] <= pd.Timestamp(end)]
+    if data.empty:
+        raise ValueError("本地没有策略所需行情，请先执行 qt data update")
+    missing = sorted(set(symbols) - set(data["symbol"]))
+    if missing:
+        raise ValueError("本地缺少行情: " + ", ".join(missing))
+    return data
+
+
+def run_strategy_signal(config: AppConfig, store: DataStore, name: str, as_of: str | None = None):
+    cfg = config.strategies.get(name, {})
+    symbols = list(cfg.get("symbols", []))
+    bars = strategy_bars(store, symbols, None, as_of)
+    if name == "microcap":
+        basic = store.read_daily_basic(None, as_of)
+        bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
+    strategy = get_strategy(name, cfg)
+    result = strategy.latest_signal(bars)
+    out_dir = config.paths.artifacts_dir / "signals" / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = result.as_of.strftime("%Y%m%d")
+    result.diagnostics.to_csv(out_dir / f"signal_{stamp}.csv", encoding="utf-8-sig")
+    pd.Series({"as_of": str(result.as_of), "summary": result.summary}).to_json(
+        out_dir / f"signal_{stamp}.json", force_ascii=False, indent=2
+    )
+    return result
+
+
+def run_strategy_backtest(
+    config: AppConfig, store: DataStore, name: str, start: str, end: str | None = None
+):
+    cfg = config.strategies.get(name, {})
+    symbols = list(cfg.get("symbols", []))
+    bars = strategy_bars(store, symbols, start, end)
+    if name == "microcap":
+        basic = store.read_daily_basic(start, end)
+        bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
+    strategy = get_strategy(name, cfg)
+    targets = strategy.generate_targets(bars)
+    bc = config.backtest
+    result = run_weight_backtest(bars, targets, ExecutionConfig(
+        initial_cash=bc.initial_cash, commission_rate=bc.commission_rate,
+        stamp_duty_rate=bc.stamp_duty_rate, slippage_rate=bc.slippage_rate,
+        risk_free_annual=bc.risk_free_annual,
+    ))
+    out_dir = config.paths.artifacts_dir / "backtests" / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result.equity.to_csv(out_dir / "equity.csv", header=True)
+    result.positions.to_csv(out_dir / "positions.csv")
+    result.trades.to_csv(out_dir / "trades.csv", index=False)
+    pd.Series(result.metrics).to_json(out_dir / "metrics.json", indent=2)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    (result.equity / result.equity.iloc[0]).plot(ax=ax, title=f"{name} backtest")
+    ax.set_ylabel("NAV")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "equity.png", dpi=150)
+    plt.close(fig)
+    return result

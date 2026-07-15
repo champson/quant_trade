@@ -1,0 +1,10 @@
+[Unit]
+Description=Quant Trade daily market review
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/quant_trade
+EnvironmentFile=/opt/quant_trade/.env
+ExecStart=/usr/bin/docker compose --profile manual run --rm daily
+

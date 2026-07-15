@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-trade"
+version = "0.1.0"
+description = "A-share market review and strategy research platform"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "akshare>=1.14",
+  "baostock>=0.8.9",
+  "duckdb>=1.0",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=16",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.2",
+  "PyYAML>=6.0",
+  "streamlit>=1.36",
+  "tushare>=1.4",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5"]
+
+[project.scripts]
+qt = "quant_trade.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quant_trade"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+

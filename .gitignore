@@ -1,0 +1,41 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Runtime data and generated artifacts
+data/raw/**
+data/processed/**
+data/archive/**
+data/quarantine/**
+data/inbox/minute/**
+artifacts/**
+runs/**
+*.duckdb
+*.duckdb.wal
+
+# Legacy secrets, caches and generated reports
+market_breadth/token.txt
+market_breadth/*.png
+market_breadth/price_cache.parquet
+market_breadth/microcap_daily.csv
+market_breadth/microcap_baskets.json
+market_breadth/乖离率*.csv
+etf/etf_cache/
+etf/data_cache/
+etf/output/
+etf/*.png
+etf/microcap_*.csv
+etf/etf_rotation_trades.csv
+
+# Keep runtime directory structure in source distributions
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/archive/.gitkeep
+!data/quarantine/.gitkeep
+!data/inbox/minute/.gitkeep
+!artifacts/.gitkeep
+!runs/.gitkeep

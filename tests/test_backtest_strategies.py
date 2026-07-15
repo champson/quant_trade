@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import pandas as pd
+
+from quant_trade.backtest.engine import ExecutionConfig, run_weight_backtest
+from quant_trade.strategies.etf_rotation import EtfRotationStrategy
+from quant_trade.strategies.microcap import MicrocapStrategy
+
+
+def _bars(symbols=("A",), periods=5):
+    dates = pd.bdate_range("2024-01-02", periods=periods)
+    rows = []
+    for j, symbol in enumerate(symbols):
+        for i, day in enumerate(dates):
+            price = 10 + j + i
+            rows.append({
+                "trade_date": day, "symbol": symbol, "open": price,
+                "high": price + 1, "low": price - 1, "close": price + 0.5,
+                "volume": 1000, "amount": 10000,
+            })
+    return pd.DataFrame(rows)
+
+
+def test_close_signal_executes_on_next_bar_open():
+    bars = _bars()
+    dates = sorted(bars["trade_date"].unique())
+    targets = pd.DataFrame({"A": [1.0]}, index=[dates[0]])
+    result = run_weight_backtest(
+        bars, targets,
+        ExecutionConfig(initial_cash=1000, commission_rate=0, stamp_duty_rate=0, slippage_rate=0),
+    )
+    assert len(result.trades) == 1
+    trade = result.trades.iloc[0]
+    assert trade["signal_date"] == dates[0]
+    assert trade["date"] == dates[1]
+    assert trade["price"] == 11
+
+
+def test_future_prices_do_not_change_past_trade():
+    bars = _bars(periods=4)
+    dates = sorted(bars["trade_date"].unique())
+    targets = pd.DataFrame({"A": [1.0]}, index=[dates[0]])
+    first = run_weight_backtest(bars, targets).trades.iloc[0]
+    changed = bars.copy()
+    changed.loc[changed["trade_date"] == dates[-1], ["open", "close"]] = 999
+    second = run_weight_backtest(changed, targets).trades.iloc[0]
+    assert first[["date", "price", "quantity"]].equals(second[["date", "price", "quantity"]])
+
+
+def test_etf_rotation_selects_top_candidate_instead_of_skipping_two():
+    bars = _bars(("A", "B", "C"), periods=8)
+    strategy = EtfRotationStrategy({
+        "momentum_windows": [2], "ma_window": 2, "hold_num": 1,
+        "rebalance_days": 1, "min_momentum": -1,
+    })
+    targets = strategy.generate_targets(bars)
+    selected = targets.iloc[-1][targets.iloc[-1] > 0]
+    assert len(selected) == 1
+    assert selected.index[0] in {"A", "B", "C"}
+
+
+def test_microcap_selection_uses_previous_day_market_cap():
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    bars = pd.DataFrame([
+        {"trade_date": day, "symbol": symbol, "close": 10, "total_mv": value}
+        for day, values in zip(dates, [(1, 2), (100, 1), (100, 1)])
+        for symbol, value in zip(("000001.SZ", "000002.SZ"), values)
+    ])
+    strategy = MicrocapStrategy({
+        "pool_size": 1, "hold_count": 1, "selection": "smallest",
+        "rebalance": "daily", "exclude_prefixes": [],
+    })
+    targets = strategy.generate_targets(bars)
+    # On day 2 it must still select symbol 1 using day 1's market cap.
+    assert targets.loc[dates[1], "000001.SZ"] == 1
+    assert targets.loc[dates[2], "000002.SZ"] == 1

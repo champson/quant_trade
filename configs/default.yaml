@@ -1,0 +1,73 @@
+paths:
+  data_dir: data
+  artifacts_dir: artifacts
+  runs_dir: runs
+  database: data/quant_trade.duckdb
+
+providers:
+  priority: [tushare, baostock, akshare]
+  allow_fallback: true
+  retry:
+    attempts: 6
+    delays: [2, 5, 10, 20, 40, 60]
+    circuit_failures: 5
+    circuit_cooldown_seconds: 300
+  tushare:
+    request_interval_seconds: 0.5
+  baostock:
+    request_interval_seconds: 0.25
+  akshare:
+    request_interval_seconds: 1.0
+
+minute:
+  inbox: data/inbox/minute
+  archive: data/archive/minute
+  quarantine: data/quarantine/minute
+  encoding_candidates: [utf-8-sig, utf-8, gb18030, gbk]
+  filename_symbol_regex: "(?P<symbol>\\d{6})(?:[._-]?(?P<exchange>SH|SZ|BJ))?"
+  timestamp_convention: source
+
+backtest:
+  initial_cash: 1000000
+  commission_rate: 0.00025
+  stamp_duty_rate: 0.0005
+  slippage_rate: 0.0002
+  risk_free_annual: 0.015
+
+strategies:
+  etf_rotation:
+    enabled: true
+    symbols: [512800.SH, 515030.SH, 515790.SH, 513100.SH, 518880.SH]
+    momentum_windows: [20, 60]
+    ma_window: 28
+    hold_num: 1
+    rebalance_days: 5
+    benchmark: 510300.SH
+  logbias:
+    enabled: true
+    symbols: [512800.SH, 515030.SH, 515790.SH]
+    ema_window: 20
+    entry: 5.0
+    overheat: 15.0
+    stop: -5.0
+  microcap:
+    enabled: false
+    pool_size: 400
+    selection: pool
+    hold_count: 400
+    rank_start: 21
+    rps_target: 70
+    rps_lookback_days: 120
+    rebalance: weekly
+    exclude_prefixes: [688, 8, 4]
+
+review:
+  indices:
+    上证指数: 000001.SH
+    沪深300: 000300.SH
+    中证500: 000905.SH
+    中证1000: 000852.SH
+    创业板指: 399006.SZ
+  portfolio_file: market_breadth/portfolio.csv
+  bias_symbols_file: market_breadth/index_list.csv
+  bias_ema_window: 20

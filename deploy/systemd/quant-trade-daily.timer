@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Quant Trade after A-share close
+
+[Timer]
+OnCalendar=Mon..Fri 15:40:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
