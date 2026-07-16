@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -26,6 +26,11 @@ class RetryConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     priority: list[str] = Field(default_factory=lambda: ["tushare", "baostock", "akshare"])
     allow_fallback: bool = True
+    calendar_mutable_ttl_hours: float = Field(default=24.0, ge=0)
+    market_snapshot_min_symbols: dict[str, int] = Field(
+        default_factory=lambda: {"stock": 4500, "convertible_bond": 250}
+    )
+    market_snapshot_reference_ratio: float = Field(default=0.9, gt=0, le=1)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     tushare: dict[str, Any] = Field(default_factory=dict)
     baostock: dict[str, Any] = Field(default_factory=dict)
@@ -41,6 +46,8 @@ class MinuteConfig(BaseModel):
     )
     filename_symbol_regex: str = r"(?P<symbol>\d{6})(?:[._-]?(?P<exchange>SH|SZ|BJ))?"
     timestamp_convention: str = "source"
+    inbox_frequency: Literal["1min", "5min", "15min", "30min", "60min"] = "1min"
+    inbox_asset_type: Literal["auto", "stock", "etf", "index"] = "auto"
     compression: str = "zstd"
     compression_level: int = 6
     chunk_rows: int = 250_000

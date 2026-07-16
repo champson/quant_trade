@@ -111,12 +111,21 @@ def run_weight_backtest(
                     quantity = min(quantity, shares[symbol])
                 if quantity <= 0:
                     continue
+                requested_quantity = float(quantity)
                 notional = quantity * exec_price
                 commission = notional * config.commission_rate
                 tax = notional * config.stamp_duty_rate if side == "SELL" else 0.0
                 if side == "BUY":
                     affordable = cash / (exec_price * (1 + config.commission_rate))
                     quantity = min(quantity, affordable)
+                    # A blocked sale can leave a dependent buy with no cash.
+                    # Preserve every material unfilled remainder for the next
+                    # open; never emit a zero-quantity trade.
+                    remainder = requested_quantity - quantity
+                    if remainder * exec_price >= exec_price * max(config.lot_size, 1):
+                        next_pending.add(symbol)
+                    if quantity <= 1e-12:
+                        continue
                     notional = quantity * exec_price
                     commission = notional * config.commission_rate
                     cash -= notional + commission

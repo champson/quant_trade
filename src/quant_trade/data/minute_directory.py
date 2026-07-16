@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -42,10 +43,16 @@ class DirectoryProfile:
     bad_headers: list[str] = field(default_factory=list)
     missing_files: list[str] = field(default_factory=list)
     unknown_asset_types: list[str] = field(default_factory=list)
+    duplicate_symbols: list[str] = field(default_factory=list)
 
     @property
     def valid(self) -> bool:
-        return not (self.bad_headers or self.missing_files or self.unknown_asset_types)
+        return not (
+            self.bad_headers
+            or self.missing_files
+            or self.unknown_asset_types
+            or self.duplicate_symbols
+        )
 
 
 @dataclass
@@ -100,6 +107,14 @@ class MinuteDirectoryImporter:
     def _normalize_symbol(value: str) -> str:
         return MinuteArchiveImporter._normalize_symbol(str(value).strip())
 
+    def _filename_symbol(self, path: Path) -> str:
+        match = re.search(self.config.minute.filename_symbol_regex, path.stem, re.IGNORECASE)
+        if not match:
+            return self._normalize_symbol(path.stem)
+        code = match.group("symbol")
+        exchange = match.groupdict().get("exchange")
+        return self._normalize_symbol(f"{code}.{exchange}" if exchange else code)
+
     def _manifest_sources(self, root: Path) -> tuple[list[DirectorySource], Path | None]:
         manifest = root / "manifest.csv"
         if not manifest.exists():
@@ -140,7 +155,7 @@ class MinuteDirectoryImporter:
                 DirectorySource(
                     path=path,
                     relative_path=str(relative),
-                    symbol=self._normalize_symbol(path.stem),
+                    symbol=self._filename_symbol(path),
                     asset_type=ASSET_TYPES.get(category, "unknown"),
                 )
             )
@@ -165,9 +180,11 @@ class MinuteDirectoryImporter:
         root_path = Path(root).expanduser().resolve()
         sources, manifest = self.discover(root_path)
         bad_headers, missing, unknown = [], [], []
+        symbol_counts: dict[str, int] = {}
         by_type: dict[str, int] = {}
         expected_rows = 0
         for source in sources:
+            symbol_counts[source.symbol] = symbol_counts.get(source.symbol, 0) + 1
             by_type[source.asset_type] = by_type.get(source.asset_type, 0) + 1
             expected_rows += source.expected_rows or 0
             if not source.path.exists():
@@ -189,6 +206,9 @@ class MinuteDirectoryImporter:
             bad_headers=bad_headers,
             missing_files=missing,
             unknown_asset_types=unknown,
+            duplicate_symbols=sorted(
+                symbol for symbol, count in symbol_counts.items() if count > 1
+            ),
         )
 
     def _encoding_and_mapping(self, path: Path) -> tuple[str, dict[str, str]]:

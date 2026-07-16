@@ -54,6 +54,7 @@ class OfflineMarketProvider(DataProvider):
 
 
 def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
+    app_config.providers.market_snapshot_min_symbols = {"stock": 2, "convertible_bond": 2}
     app_config.review = {"indices": {}}
     app_config.strategies = {}
     app_config.providers.priority = ["offline"]
@@ -134,6 +135,7 @@ class StrategyPipelineProvider(DataProvider):
 
 
 def test_daily_pipeline_updates_strategy_and_benchmark_contracts(app_config, monkeypatch):
+    app_config.providers.market_snapshot_min_symbols = {"stock": 2, "convertible_bond": 2}
     app_config.review = {"indices": {}}
     app_config.strategies = {
         "etf_rotation": {

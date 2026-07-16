@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant_trade.data.minute_directory import MinuteDirectoryImporter
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.storage import DataStore
 
 
@@ -149,3 +151,29 @@ def test_empty_source_does_not_delete_existing_partitions(app_config, tmp_path):
     assert second.files_empty == 1
     assert partition.exists()
     assert len(pd.read_parquet(partition)) == 1
+
+
+def test_directory_rejects_multiple_files_for_same_symbol(app_config, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    for year in (2024, 2025):
+        (source / f"000001.SZ-{year}.csv").write_text(
+            HEADER + f"000001.SZ,{year}-01-02 09:35:00,10,10,10,10,100,1000\n",
+            encoding="utf-8-sig",
+        )
+    pd.DataFrame(
+        [
+            {
+                "category": "stock",
+                "ts_code": "000001.SZ",
+                "relative_file": f"000001.SZ-{year}.csv",
+                "rows": 1,
+            }
+            for year in (2024, 2025)
+        ]
+    ).to_csv(source / "manifest.csv", index=False, encoding="utf-8-sig")
+    importer = MinuteDirectoryImporter(app_config, DataStore(app_config))
+    profile = importer.inspect_directory(source)
+    assert profile.duplicate_symbols == ["000001.SZ"]
+    with pytest.raises(DataQualityError, match="duplicate_symbols"):
+        importer.import_directory(source, "5min")

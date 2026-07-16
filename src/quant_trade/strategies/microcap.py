@@ -27,17 +27,16 @@ class MicrocapStrategy(Strategy):
         rebalance = str(self.config.get("rebalance", "weekly"))
         targets = pd.DataFrame(0.0, index=mv.index, columns=mv.columns)
         current = pd.Series(0.0, index=mv.columns)
+        if rebalance == "weekly":
+            periods = mv.index.to_period("W")
+            rebalance_dates = set(mv.index[~periods.duplicated()])
+        elif rebalance == "monthly":
+            periods = mv.index.to_period("M")
+            rebalance_dates = set(mv.index[~periods.duplicated()])
+        else:
+            rebalance_dates = set(mv.index)
         for date in mv.index:
-            if rebalance == "weekly":
-                week = date.to_period("W")
-                future_same_week = mv.index[(mv.index > date) & (mv.index.to_period("W") == week)]
-                should_rebalance = len(future_same_week) == 0
-            elif rebalance == "monthly":
-                month = date.to_period("M")
-                future_same_month = mv.index[(mv.index > date) & (mv.index.to_period("M") == month)]
-                should_rebalance = len(future_same_month) == 0
-            else:
-                should_rebalance = True
+            should_rebalance = date in rebalance_dates
             if should_rebalance:
                 values = mv.loc[date].where(prices.loc[date].notna()).dropna()
                 values = values[

@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from quant_trade.data.base import EmptyDataError
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.storage import DataStore
 from quant_trade.models import AssetType, DataBatch, Dataset
 from quant_trade.services import update_bars
@@ -197,6 +199,43 @@ def test_today_without_data_is_not_marked_covered(app_config, monkeypatch):
     assert router.requests[0].end == date(2024, 1, 10)
 
 
+def test_future_end_is_clamped_without_future_empty_requests(app_config, monkeypatch):
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return date(2024, 1, 10)
+
+    monkeypatch.setattr("quant_trade.services.date", FakeDate)
+    store = DataStore(app_config)
+    router = RecordingRouter()
+    update_bars(
+        app_config,
+        router,
+        store,
+        ["000001.SZ"],
+        date(2024, 1, 2),
+        date(2024, 1, 15),
+        AssetType.STOCK,
+    )
+    assert router.calendar_requests[0].end == date(2024, 1, 10)
+    assert router.requests[0].end == date(2024, 1, 10)
+
+    router.calendar_requests.clear()
+    router.requests.clear()
+    result = update_bars(
+        app_config,
+        router,
+        store,
+        ["000001.SZ"],
+        date(2024, 1, 11),
+        date(2024, 1, 15),
+        AssetType.STOCK,
+    )
+    assert result.empty
+    assert router.calendar_requests == []
+    assert router.requests == []
+
+
 def test_unpublished_today_empty_error_is_retried(app_config, monkeypatch):
     class FakeDate(date):
         @classmethod
@@ -322,3 +361,53 @@ def test_confirmed_empty_range_is_cached_without_parquet(app_config):
         )
     assert len(router.requests) == 1
     assert not store.daily_path(AssetType.STOCK, "999999.SZ").exists()
+
+
+def test_partial_market_snapshot_is_retried_until_symbol_threshold_is_met(app_config):
+    app_config.providers.market_snapshot_min_symbols = {"stock": 3}
+
+    class SnapshotRouter:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, request):
+            self.calls += 1
+            symbols = ["000001.SZ", "000002.SZ"]
+            if self.calls > 1:
+                symbols.append("000003.SZ")
+            data = pd.concat(
+                [_rows(symbol, [pd.Timestamp(request.end)]) for symbol in symbols],
+                ignore_index=True,
+            )
+            data["adjustment"] = str(request.adjustment)
+            return DataBatch(data, "snapshot", request)
+
+    store = DataStore(app_config)
+    router = SnapshotRouter()
+    with pytest.raises(DataQualityError, match="快照不完整"):
+        update_bars(
+            app_config,
+            router,
+            store,
+            [],
+            date(2024, 1, 8),
+            date(2024, 1, 8),
+            AssetType.STOCK,
+        )
+    for _ in range(2):
+        update_bars(
+            app_config,
+            router,
+            store,
+            [],
+            date(2024, 1, 8),
+            date(2024, 1, 8),
+            AssetType.STOCK,
+        )
+    assert router.calls == 2
+    assert store.market_snapshot_complete(AssetType.STOCK, date(2024, 1, 8))
+    with store.connect() as con:
+        state = con.execute(
+            "SELECT symbol_count, expected_symbols, status FROM market_snapshots"
+        ).fetchone()
+    assert state == (3, 3, "complete")

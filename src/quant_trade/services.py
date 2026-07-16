@@ -8,6 +8,7 @@ from quant_trade.backtest import ExecutionConfig, run_weight_backtest, save_back
 from quant_trade.config import AppConfig
 from quant_trade.data.calendar import trading_days
 from quant_trade.data.base import EmptyDataError
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
 from quant_trade.models import Adjustment, AssetType, DataRequest, Dataset, Frequency
@@ -45,6 +46,9 @@ def update_bars(
     resume: bool = True,
 ) -> pd.DataFrame:
     mode = Adjustment(adjustment)
+    end = min(end, date.today())
+    if start > end:
+        return pd.DataFrame()
     groups = [[symbol] for symbol in symbols] if symbols else [[]]
     frames: list[pd.DataFrame] = []
     expected = trading_days(router, start, end, store) if symbols else []
@@ -94,7 +98,49 @@ def update_bars(
             if not batch.data.empty:
                 store.write_daily(batch.data, asset_type)
             if not group and start == end:
-                store.mark_market_snapshot(asset_type, end, mode)
+                snapshot = batch.data.copy()
+                snapshot["trade_date"] = pd.to_datetime(snapshot["trade_date"]).dt.date
+                snapshot = snapshot[snapshot["trade_date"] == end]
+                row_count = len(snapshot)
+                symbol_count = int(snapshot["symbol"].nunique())
+                configured_min = int(
+                    config.providers.market_snapshot_min_symbols.get(asset_type.value, 0)
+                )
+                basic_count = (
+                    store.daily_basic_symbol_count(end) if asset_type == AssetType.STOCK else 0
+                )
+                prior_count = store.latest_complete_snapshot_symbol_count(asset_type, mode, end)
+                reference_floor = int(
+                    prior_count * config.providers.market_snapshot_reference_ratio
+                )
+                basic_floor = int(basic_count * config.providers.market_snapshot_reference_ratio)
+                provider_expected = int(batch.metadata.get("expected_symbols", 0))
+                expected_symbols = max(
+                    configured_min, basic_floor, reference_floor, provider_expected
+                )
+                complete = expected_symbols > 0 and symbol_count >= expected_symbols
+                status = "complete" if complete else "incomplete"
+                store.mark_market_snapshot(
+                    asset_type,
+                    end,
+                    mode,
+                    row_count=row_count,
+                    symbol_count=symbol_count,
+                    expected_symbols=expected_symbols,
+                    provider=batch.provider,
+                    status=status,
+                    details={
+                        "configured_min": configured_min,
+                        "daily_basic_symbols": basic_count,
+                        "prior_complete_symbols": prior_count,
+                        "provider_expected_symbols": provider_expected,
+                    },
+                )
+                if not complete:
+                    raise DataQualityError(
+                        f"全市场快照不完整：{symbol_count} 个证券，至少需要 {expected_symbols}；"
+                        "已保存数据但不会标记完成"
+                    )
             frames.append(batch.data)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 

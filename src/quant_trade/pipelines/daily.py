@@ -87,9 +87,9 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
         calendar = trading_days(router, date(as_of.year - 1, 12, 1), as_of, store)
         snapshot_dates = _anchors(calendar, as_of)
         for snapshot in snapshot_dates:
-            update_bars(config, router, store, [], snapshot, snapshot, AssetType.STOCK)
             if config.strategies.get("microcap", {}).get("enabled"):
                 update_daily_basic(router, store, snapshot)
+            update_bars(config, router, store, [], snapshot, snapshot, AssetType.STOCK)
             try:
                 update_bars(
                     config, router, store, [], snapshot, snapshot, AssetType.CONVERTIBLE_BOND
@@ -131,7 +131,10 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
                 adjustment=adjustment.value,
             )
 
-        imported = MinuteArchiveImporter(config, store).import_inbox()
+        imported = MinuteArchiveImporter(config, store).import_inbox(
+            frequency=config.minute.inbox_frequency,
+            asset_type=config.minute.inbox_asset_type,
+        )
         result.minute_imports = [r.__dict__ for r in imported]
 
         market = store.read_daily(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -28,7 +28,7 @@ def _open_days(frame: pd.DataFrame) -> list[date]:
         values = frame.loc[mask, "calendar_date"]
     else:
         raise ValueError("交易日历字段无法识别")
-    return sorted(pd.to_datetime(values).dt.date.tolist())
+    return sorted(set(pd.to_datetime(values).dt.date.tolist()))
 
 
 def _missing_calendar_ranges(
@@ -55,12 +55,25 @@ def trading_days(
     start: date,
     end: date,
     store: DataStore | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> list[date]:
     if store is None:
         batch = router.fetch(DataRequest(dataset=Dataset.TRADE_CALENDAR, start=start, end=end))
         return _open_days(batch.data.copy())
 
-    covered = store.covered_calendar_dates(start, end)
+    providers_config = getattr(getattr(router, "config", None), "providers", None)
+    ttl_hours = float(getattr(providers_config, "calendar_mutable_ttl_hours", 24.0))
+    covered = (
+        set()
+        if force_refresh
+        else store.covered_calendar_dates(
+            start,
+            end,
+            mutable_from=date.today(),
+            mutable_ttl=timedelta(hours=ttl_hours),
+        )
+    )
     for fetch_start, fetch_end, calendar_days in _missing_calendar_ranges(start, end, covered):
         batch = router.fetch(
             DataRequest(dataset=Dataset.TRADE_CALENDAR, start=fetch_start, end=fetch_end)

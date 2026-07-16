@@ -6,11 +6,14 @@ import io
 import json
 import re
 import shutil
+import uuid
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from quant_trade.config import AppConfig
 from quant_trade.data.quality import DataQualityError, validate_bars
@@ -147,8 +150,46 @@ class MinuteArchiveImporter:
             exchange = "SH" if code.startswith(("5", "6", "9")) else "SZ"
         return f"{code}.{exchange.upper()}"
 
+    @staticmethod
+    def _asset_type(symbol: str, requested: str) -> str:
+        if requested != "auto":
+            if requested not in {"stock", "etf", "index"}:
+                raise ValueError("asset_type 只支持 auto/stock/etf/index")
+            return requested
+        code, _, exchange = symbol.partition(".")
+        if code.startswith(("5", "15")):
+            return "etf"
+        if code.startswith("399") or (exchange == "SH" and code.startswith("000")):
+            return "index"
+        return "stock"
+
+    @staticmethod
+    def _arrow_schema() -> pa.Schema:
+        return pa.schema(
+            [
+                ("symbol", pa.string()),
+                ("asset_type", pa.string()),
+                ("frequency", pa.string()),
+                ("trade_date", pa.date32()),
+                ("bar_time", pa.timestamp("ns")),
+                ("open", pa.float64()),
+                ("high", pa.float64()),
+                ("low", pa.float64()),
+                ("close", pa.float64()),
+                ("volume", pa.float64()),
+                ("amount", pa.float64()),
+                ("is_auction", pa.bool_()),
+                ("source", pa.string()),
+            ]
+        )
+
     def _normalize_chunk(
-        self, chunk: pd.DataFrame, member: str, profile: ArchiveProfile, file_hash: str
+        self,
+        chunk: pd.DataFrame,
+        member: str,
+        profile: ArchiveProfile,
+        frequency: str,
+        asset_type: str,
     ) -> pd.DataFrame:
         out = chunk.rename(columns=profile.columns).copy()
         if "symbol" not in out:
@@ -167,16 +208,34 @@ class MinuteArchiveImporter:
             out["bar_time"] = pd.to_datetime(out["trade_date"], errors="coerce")
         if "trade_date" in out and out["bar_time"].isna().any():
             out["bar_time"] = pd.to_datetime(out["trade_date"].astype(str), errors="coerce")
-        out["trade_date"] = out["bar_time"].dt.strftime("%Y-%m-%d")
+        out["trade_date"] = out["bar_time"].dt.date
         for col in ("open", "high", "low", "close", "volume", "amount"):
             if col not in out:
                 out[col] = pd.NA
             out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.dropna(subset=["symbol", "bar_time", "open", "high", "low", "close", "volume"])
+        member_category = next(
+            (
+                part.lower()
+                for part in Path(member).parts[:-1]
+                if part.lower() in {"stock", "etf", "index"}
+            ),
+            asset_type,
+        )
+        requested_asset = member_category if asset_type == "auto" else asset_type
+        out["asset_type"] = out["symbol"].map(
+            lambda symbol: self._asset_type(symbol, requested_asset)
+        )
+        out["frequency"] = frequency
+        out["is_auction"] = out["asset_type"].eq("stock") & out["bar_time"].dt.strftime(
+            "%H:%M:%S"
+        ).eq("09:30:00")
         out["source"] = "tushare_zip"
-        out["source_file_hash"] = file_hash
         return out[
             [
                 "symbol",
+                "asset_type",
+                "frequency",
                 "trade_date",
                 "bar_time",
                 "open",
@@ -185,10 +244,10 @@ class MinuteArchiveImporter:
                 "close",
                 "volume",
                 "amount",
+                "is_auction",
                 "source",
-                "source_file_hash",
             ]
-        ].dropna(subset=["symbol", "bar_time", "open", "high", "low", "close", "volume"])
+        ]
 
     @staticmethod
     def _normalize_symbol(value: str) -> str:
@@ -201,17 +260,33 @@ class MinuteArchiveImporter:
         return f"{value}.{'SH' if value.startswith(('5', '6', '9')) else 'SZ'}"
 
     def import_archive(
-        self, path: str | Path, profile: ArchiveProfile | None = None
+        self,
+        path: str | Path,
+        profile: ArchiveProfile | None = None,
+        *,
+        frequency: str = "1min",
+        asset_type: str = "auto",
     ) -> ImportResult:
+        if frequency not in {"1min", "5min", "15min", "30min", "60min"}:
+            raise ValueError("不支持的分钟频率")
+        if asset_type not in {"auto", "stock", "etf", "index"}:
+            raise ValueError("asset_type 只支持 auto/stock/etf/index")
         path = Path(path)
         file_hash = self.hash_file(path)
-        if self.store.minute_imported(file_hash):
+        if self.store.minute_imported(file_hash, frequency, asset_type):
             return ImportResult(file_hash, path.name, "skipped", warnings=["文件已导入"])
         profile = profile or self.inspect(path)
         result = ImportResult(file_hash, path.name, "failed", warnings=list(profile.warnings))
         min_time = None
         max_time = None
+        staging = self.store.root / ".staging" / "minute-archive" / uuid.uuid4().hex
+        writers: dict[tuple[str, int], pq.ParquetWriter] = {}
+        staged: dict[tuple[str, int], Path] = {}
+        statistics: dict[tuple[str, int], dict] = {}
+        symbol_assets: dict[str, str] = {}
+        previous_times: dict[str, pd.Timestamp] = {}
         try:
+            staging.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(path) as archive:
                 members = {m.filename: m for m in self._safe_members(archive)}
                 for name in profile.members:
@@ -224,10 +299,74 @@ class MinuteArchiveImporter:
                             low_memory=False,
                             dtype=str,
                         ):
-                            normalized = self._normalize_chunk(chunk, name, profile, file_hash)
+                            normalized = self._normalize_chunk(
+                                chunk, name, profile, frequency, asset_type
+                            )
                             if not normalized.empty:
-                                result.warnings.extend(validate_bars(normalized, minute=True))
-                                self.store.write_minute(normalized)
+                                result.warnings.extend(
+                                    validate_bars(
+                                        normalized.assign(
+                                            trade_date=normalized["trade_date"].astype(str)
+                                        ),
+                                        minute=True,
+                                    )
+                                )
+                                for symbol, symbol_frame in normalized.groupby(
+                                    "symbol", sort=False
+                                ):
+                                    symbol_frame = symbol_frame.sort_values("bar_time")
+                                    if symbol in previous_times and (
+                                        symbol_frame["bar_time"].iloc[0] <= previous_times[symbol]
+                                    ):
+                                        raise DataQualityError(
+                                            f"{symbol} 在ZIP成员或分块边界存在重复/倒序K线"
+                                        )
+                                    previous_times[symbol] = symbol_frame["bar_time"].iloc[-1]
+                                    actual_asset = str(symbol_frame["asset_type"].iloc[0])
+                                    symbol_assets[symbol] = actual_asset
+                                    for year, part in symbol_frame.groupby(
+                                        symbol_frame["bar_time"].dt.year
+                                    ):
+                                        key = (str(symbol), int(year))
+                                        if key not in writers:
+                                            staged_path = (
+                                                staging
+                                                / self.store.safe_symbol(str(symbol))
+                                                / f"year={int(year)}.parquet"
+                                            )
+                                            staged_path.parent.mkdir(parents=True, exist_ok=True)
+                                            writers[key] = pq.ParquetWriter(
+                                                staged_path,
+                                                self._arrow_schema(),
+                                                compression=self.config.minute.compression,
+                                                compression_level=self.config.minute.compression_level,
+                                                use_dictionary=True,
+                                                write_statistics=True,
+                                            )
+                                            staged[key] = staged_path
+                                            statistics[key] = {
+                                                "rows": 0,
+                                                "min_time": part["bar_time"].min(),
+                                                "max_time": part["bar_time"].max(),
+                                            }
+                                        writers[key].write_table(
+                                            pa.Table.from_pandas(
+                                                part,
+                                                schema=self._arrow_schema(),
+                                                preserve_index=False,
+                                                safe=False,
+                                            ),
+                                            row_group_size=self.config.minute.row_group_rows,
+                                        )
+                                        statistics[key]["rows"] += len(part)
+                                        statistics[key]["min_time"] = min(
+                                            statistics[key]["min_time"],
+                                            part["bar_time"].min(),
+                                        )
+                                        statistics[key]["max_time"] = max(
+                                            statistics[key]["max_time"],
+                                            part["bar_time"].max(),
+                                        )
                                 result.rows += len(normalized)
                                 chunk_min = normalized["bar_time"].min()
                                 chunk_max = normalized["bar_time"].max()
@@ -239,6 +378,35 @@ class MinuteArchiveImporter:
                                 )
             if result.rows == 0:
                 raise DataQualityError("ZIP 中没有可导入的分钟记录")
+            for writer in writers.values():
+                writer.close()
+            writers.clear()
+            entries = []
+            for symbol in sorted(symbol_assets):
+                years = {
+                    year: staged[(symbol, year)]
+                    for item_symbol, year in staged
+                    if item_symbol == symbol
+                }
+                stats = {
+                    year: statistics[(symbol, year)]
+                    for item_symbol, year in statistics
+                    if item_symbol == symbol
+                }
+                entries.append(
+                    {
+                        "frequency": frequency,
+                        "symbol": symbol,
+                        "asset_type": symbol_assets[symbol],
+                        "staged": years,
+                        "statistics": stats,
+                        "source_hash": file_hash,
+                        # A ZIP may be an incremental delivery. Preserve years
+                        # not represented by this archive.
+                        "replace_symbol": False,
+                    }
+                )
+            self.store.commit_minute_batch(entries)
             result.status = "success"
             result.min_time = str(min_time)
             result.max_time = str(max_time)
@@ -246,6 +414,10 @@ class MinuteArchiveImporter:
         except Exception as exc:
             result.warnings.append(str(exc))
             destination = self.config.minute.quarantine / path.name
+        finally:
+            for writer in writers.values():
+                writer.close()
+            shutil.rmtree(staging, ignore_errors=True)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path.resolve() != destination.resolve():
             if destination.exists():
@@ -254,6 +426,8 @@ class MinuteArchiveImporter:
         self.store.record_minute_import(
             {
                 "file_hash": file_hash,
+                "frequency": frequency,
+                "asset_type": asset_type,
                 "file_name": path.name,
                 "rows": result.rows,
                 "min_time": result.min_time,
@@ -266,11 +440,15 @@ class MinuteArchiveImporter:
             raise DataQualityError("; ".join(result.warnings))
         return result
 
-    def import_inbox(self) -> list[ImportResult]:
+    def import_inbox(
+        self, *, frequency: str = "1min", asset_type: str = "auto"
+    ) -> list[ImportResult]:
         results = []
         for path in sorted(self.config.minute.inbox.glob("*.zip")):
             try:
-                results.append(self.import_archive(path))
+                results.append(
+                    self.import_archive(path, frequency=frequency, asset_type=asset_type)
+                )
             except DataQualityError as exc:
                 results.append(ImportResult("", path.name, "failed", warnings=[str(exc)]))
         return results

@@ -55,6 +55,11 @@ def _date(value: str | None, default: date) -> date:
     return pd.Timestamp(value).date() if value else default
 
 
+def _reject_future(value: date, param_hint: str) -> None:
+    if value > date.today():
+        raise typer.BadParameter("不支持请求未来行情日期", param_hint=param_hint)
+
+
 @data_app.command("update")
 def data_update(
     symbols: Annotated[str, typer.Option(help="逗号分隔代码；留空表示 Tushare 当日全市场")] = "",
@@ -67,6 +72,7 @@ def data_update(
     config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
     end_date = _date(end, date.today())
+    _reject_future(end_date, "--end")
     start_date = _date(start, end_date if not symbols else end_date - timedelta(days=420))
     codes = [x.strip() for x in symbols.split(",") if x.strip()]
     if not codes and adjustment != Adjustment.NONE:
@@ -107,8 +113,9 @@ def market_history(
     config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
     """按交易日下载全市场行情，为市场宽度和微盘股研究准备数据。"""
-    cfg, store, router = _runtime(config)
     start_date, end_date = pd.Timestamp(start).date(), _date(end, date.today())
+    _reject_future(end_date, "--end")
+    cfg, store, router = _runtime(config)
     try:
         days = trading_days(router, start_date, end_date, store)
         for index, trade_date in enumerate(days, 1):
@@ -142,17 +149,31 @@ def minute_inspect(
 
 @minute_app.command("import")
 def minute_import(
-    path: Path, config: Annotated[str | None, typer.Option("--config")] = None
+    path: Path,
+    frequency: Annotated[str | None, typer.Option()] = None,
+    asset_type: Annotated[str | None, typer.Option()] = None,
+    config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
     cfg = load_config(config)
-    result = MinuteArchiveImporter(cfg, DataStore(cfg)).import_archive(path)
+    result = MinuteArchiveImporter(cfg, DataStore(cfg)).import_archive(
+        path,
+        frequency=frequency or cfg.minute.inbox_frequency,
+        asset_type=asset_type or cfg.minute.inbox_asset_type,
+    )
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
 
 
 @minute_app.command("import-inbox")
-def minute_import_inbox(config: Annotated[str | None, typer.Option("--config")] = None) -> None:
+def minute_import_inbox(
+    frequency: Annotated[str | None, typer.Option()] = None,
+    asset_type: Annotated[str | None, typer.Option()] = None,
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
     cfg = load_config(config)
-    results = MinuteArchiveImporter(cfg, DataStore(cfg)).import_inbox()
+    results = MinuteArchiveImporter(cfg, DataStore(cfg)).import_inbox(
+        frequency=frequency or cfg.minute.inbox_frequency,
+        asset_type=asset_type or cfg.minute.inbox_asset_type,
+    )
     typer.echo(json.dumps([asdict(x) for x in results], ensure_ascii=False, indent=2))
 
 
@@ -299,9 +320,11 @@ def daily_run(
     as_of: Annotated[str | None, typer.Option()] = None,
     config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
+    as_of_date = _date(as_of, date.today())
+    _reject_future(as_of_date, "--as-of")
     cfg, store, router = _runtime(config)
     try:
-        result = run_daily(cfg, router, store, _date(as_of, date.today()))
+        result = run_daily(cfg, router, store, as_of_date)
         typer.echo(json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str))
     finally:
         router.close()

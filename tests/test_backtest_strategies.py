@@ -112,6 +112,30 @@ def test_blocked_order_retry_does_not_rebalance_other_positions():
     assert retry_day["symbol"].tolist() == ["A"]
 
 
+def test_blocked_sale_retries_dependent_buy_after_cash_is_released():
+    bars = _bars(("A", "B"), periods=5)
+    dates = sorted(bars["trade_date"].unique())
+    bars = bars[~((bars["symbol"] == "A") & (bars["trade_date"] == dates[2]))]
+    targets = pd.DataFrame({"A": [1.0, 0.0], "B": [0.0, 1.0]}, index=[dates[0], dates[1]])
+    result = run_weight_backtest(
+        bars,
+        targets,
+        ExecutionConfig(
+            initial_cash=1000,
+            commission_rate=0,
+            stamp_duty_rate=0,
+            slippage_rate=0,
+        ),
+    )
+    retry_day = result.trades[result.trades["date"] == dates[3]]
+    assert retry_day[["symbol", "side"]].values.tolist() == [
+        ["A", "SELL"],
+        ["B", "BUY"],
+    ]
+    assert (result.trades["quantity"] > 0).all()
+    assert result.positions.iloc[-1]["B"] == pytest.approx(1.0)
+
+
 def test_etf_rotation_selects_top_candidate_instead_of_skipping_two():
     bars = _bars(("A", "B", "C"), periods=8)
     strategy = EtfRotationStrategy(
@@ -158,3 +182,37 @@ def test_microcap_selection_uses_previous_day_market_cap():
     # On day 2 it must still select symbol 1 using day 1's market cap.
     assert targets.loc[dates[1], "000001.SZ"] == 1
     assert targets.loc[dates[2], "000002.SZ"] == 1
+
+
+def test_microcap_weekly_targets_do_not_change_when_future_day_is_appended():
+    dates = pd.bdate_range("2024-01-05", periods=6)
+    bars = pd.DataFrame(
+        [
+            {
+                "trade_date": day,
+                "symbol": symbol,
+                "close": 10,
+                "total_mv": value,
+            }
+            for index, day in enumerate(dates)
+            for symbol, value in zip(
+                ("000001.SZ", "000002.SZ"),
+                ((1, 100) if index < 4 else (100, 1)),
+            )
+        ]
+    )
+    strategy = MicrocapStrategy(
+        {
+            "pool_size": 1,
+            "hold_count": 1,
+            "selection": "smallest",
+            "rebalance": "weekly",
+            "exclude_prefixes": [],
+        }
+    )
+    through_thursday = strategy.generate_targets(bars[bars["trade_date"] <= dates[-2]])
+    through_friday = strategy.generate_targets(bars)
+    pd.testing.assert_frame_equal(
+        through_thursday,
+        through_friday.loc[through_thursday.index],
+    )

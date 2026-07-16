@@ -75,7 +75,12 @@ def main() -> None:
             )
             st.subheader("分钟文件导入")
             st.dataframe(
-                con.execute("SELECT * FROM minute_imports ORDER BY imported_at DESC LIMIT 50").df(),
+                con.execute(
+                    """
+                    SELECT * FROM minute_archive_imports
+                    ORDER BY imported_at DESC LIMIT 50
+                    """
+                ).df(),
                 use_container_width=True,
             )
             st.subheader("分钟目录导入")

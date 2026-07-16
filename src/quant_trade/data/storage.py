@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import shutil
+import uuid
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,13 @@ class DataStore:
                     file_hash VARCHAR PRIMARY KEY, file_name VARCHAR,
                     imported_at TIMESTAMP, rows BIGINT, min_time TIMESTAMP,
                     max_time TIMESTAMP, status VARCHAR, details VARCHAR
+                );
+                CREATE TABLE IF NOT EXISTS minute_archive_imports (
+                    file_hash VARCHAR, frequency VARCHAR, asset_type VARCHAR,
+                    file_name VARCHAR, imported_at TIMESTAMP, rows BIGINT,
+                    min_time TIMESTAMP, max_time TIMESTAMP, status VARCHAR,
+                    details VARCHAR,
+                    PRIMARY KEY (file_hash, frequency, asset_type)
                 );
                 CREATE TABLE IF NOT EXISTS minute_sources (
                     source_path VARCHAR, frequency VARCHAR, symbol VARCHAR,
@@ -79,6 +88,13 @@ class DataStore:
                 CREATE TABLE IF NOT EXISTS calendar_coverage (
                     cal_date DATE PRIMARY KEY, source VARCHAR, updated_at TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    asset_type VARCHAR, adjustment VARCHAR, trade_date DATE,
+                    row_count BIGINT, symbol_count BIGINT, expected_symbols BIGINT,
+                    provider VARCHAR, status VARCHAR, checked_at TIMESTAMP,
+                    details VARCHAR,
+                    PRIMARY KEY (asset_type, adjustment, trade_date)
+                );
                 ALTER TABLE data_fetches ADD COLUMN IF NOT EXISTS adjustment VARCHAR;
                 """
             )
@@ -109,31 +125,79 @@ class DataStore:
         trade_date: date | str,
         adjustment: Adjustment | str = Adjustment.NONE,
     ) -> bool:
-        stamp = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
-        return (
-            self.root
-            / "snapshots"
-            / AssetType(asset_type).value
-            / f"adjustment={Adjustment(adjustment).value}"
-            / f"{stamp}.complete"
-        ).exists()
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT status FROM market_snapshots
+                WHERE asset_type = ? AND adjustment = ? AND trade_date = ?
+                """,
+                [
+                    AssetType(asset_type).value,
+                    Adjustment(adjustment).value,
+                    pd.Timestamp(trade_date).date(),
+                ],
+            ).fetchone()
+        return bool(row and row[0] == "complete")
 
     def mark_market_snapshot(
         self,
         asset_type: AssetType | str,
         trade_date: date | str,
         adjustment: Adjustment | str = Adjustment.NONE,
+        *,
+        row_count: int = 0,
+        symbol_count: int = 0,
+        expected_symbols: int = 0,
+        provider: str = "manual",
+        status: str = "complete",
+        details: dict[str, Any] | None = None,
     ) -> None:
-        stamp = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
-        path = (
-            self.root
-            / "snapshots"
-            / AssetType(asset_type).value
-            / f"adjustment={Adjustment(adjustment).value}"
-            / f"{stamp}.complete"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+        if status not in {"complete", "incomplete"}:
+            raise ValueError("快照状态只支持 complete/incomplete")
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO market_snapshots
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    AssetType(asset_type).value,
+                    Adjustment(adjustment).value,
+                    pd.Timestamp(trade_date).date(),
+                    row_count,
+                    symbol_count,
+                    expected_symbols,
+                    provider,
+                    status,
+                    datetime.now(),
+                    json.dumps(details or {}, ensure_ascii=False),
+                ],
+            )
+
+    def latest_complete_snapshot_symbol_count(
+        self,
+        asset_type: AssetType | str,
+        adjustment: Adjustment | str,
+        before: date,
+    ) -> int:
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT symbol_count FROM market_snapshots
+                WHERE asset_type = ? AND adjustment = ? AND trade_date < ?
+                  AND status = 'complete'
+                ORDER BY trade_date DESC LIMIT 1
+                """,
+                [AssetType(asset_type).value, Adjustment(adjustment).value, before],
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def daily_basic_symbol_count(self, trade_date: date | str) -> int:
+        path = self.daily_basic_path(pd.Timestamp(trade_date).strftime("%Y-%m-%d"))
+        if not path.exists():
+            return 0
+        frame = pd.read_parquet(path, columns=["symbol"])
+        return int(frame["symbol"].nunique())
 
     @staticmethod
     def _with_daily_metadata(
@@ -247,14 +311,24 @@ class DataStore:
                 [(asset, mode, symbol, day, "empty", now) for day in days],
             )
 
-    def covered_calendar_dates(self, start: date, end: date) -> set[date]:
+    def covered_calendar_dates(
+        self,
+        start: date,
+        end: date,
+        *,
+        mutable_from: date,
+        mutable_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> set[date]:
+        cutoff = (now or datetime.now()) - mutable_ttl
         with self.connect() as con:
             rows = con.execute(
                 """
                 SELECT cal_date FROM calendar_coverage
                 WHERE cal_date BETWEEN ? AND ?
+                  AND (cal_date < ? OR updated_at >= ?)
                 """,
-                [start, end],
+                [start, end, mutable_from, cutoff],
             ).fetchall()
         return {pd.Timestamp(row[0]).date() for row in rows}
 
@@ -275,6 +349,8 @@ class DataStore:
         covered_days: list[date],
         source: str,
     ) -> None:
+        covered_days = sorted(set(covered_days))
+        open_days = sorted(set(open_days))
         if not covered_days:
             return
         now = datetime.now()
@@ -363,45 +439,112 @@ class DataStore:
         statistics: dict[int, dict[str, Any]],
         source_hash: str,
     ) -> None:
-        """Atomically replace each symbol/year file, then update the catalog."""
-        target_dir = self.minute_symbol_year_path(frequency, symbol, 2000).parent
-        target_dir.mkdir(parents=True, exist_ok=True)
-        new_years = set(staged)
-        existing = set()
-        for path in target_dir.glob("year=*.parquet"):
-            try:
-                existing.add(int(path.stem.split("=", 1)[1]))
-            except (IndexError, ValueError):
-                continue
-        for year, staged_path in staged.items():
-            target = self.minute_symbol_year_path(frequency, symbol, year)
-            staged_path.replace(target)
-        for stale_year in existing - new_years:
-            self.minute_symbol_year_path(frequency, symbol, stale_year).unlink(missing_ok=True)
+        """Replace one symbol mirror through the shared batch commit path."""
+        self.commit_minute_batch(
+            [
+                {
+                    "frequency": frequency,
+                    "symbol": symbol,
+                    "asset_type": asset_type,
+                    "staged": staged,
+                    "statistics": statistics,
+                    "source_hash": source_hash,
+                    "replace_symbol": True,
+                }
+            ]
+        )
 
-        with self.connect() as con:
-            con.execute(
-                "DELETE FROM minute_partitions WHERE frequency = ? AND symbol = ?",
-                [frequency, symbol],
-            )
-            for year in sorted(new_years):
-                stat = statistics[year]
-                target = self.minute_symbol_year_path(frequency, symbol, year).resolve()
-                con.execute(
-                    "INSERT INTO minute_partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        frequency,
-                        symbol,
-                        year,
-                        asset_type,
-                        str(target),
-                        stat["rows"],
-                        stat["min_time"],
-                        stat["max_time"],
-                        source_hash,
-                        datetime.now(),
-                    ],
-                )
+    def commit_minute_batch(self, entries: list[dict[str, Any]]) -> None:
+        """Commit staged symbol/year files and their catalog rows as one recoverable batch."""
+        if not entries:
+            return
+        backup_root = self.root / ".staging" / "minute-commit" / uuid.uuid4().hex
+        backup_root.mkdir(parents=True, exist_ok=True)
+        installed: list[Path] = []
+        backups: list[tuple[Path, Path]] = []
+        con = self.connect()
+        try:
+            for entry in entries:
+                frequency = str(entry["frequency"])
+                symbol = str(entry["symbol"])
+                staged: dict[int, Path] = entry["staged"]
+                target_dir = self.minute_symbol_year_path(frequency, symbol, 2000).parent
+                target_dir.mkdir(parents=True, exist_ok=True)
+                new_years = set(staged)
+                existing_years: set[int] = set()
+                for path in target_dir.glob("year=*.parquet"):
+                    try:
+                        existing_years.add(int(path.stem.split("=", 1)[1]))
+                    except (IndexError, ValueError):
+                        continue
+                affected = set(new_years)
+                if entry.get("replace_symbol", True):
+                    affected |= existing_years
+                for year in sorted(affected):
+                    target = self.minute_symbol_year_path(frequency, symbol, year)
+                    if target.exists():
+                        backup = (
+                            backup_root
+                            / f"{self.safe_symbol(frequency)}-{self.safe_symbol(symbol)}-{year}.parquet"
+                        )
+                        target.replace(backup)
+                        backups.append((backup, target))
+                for year, staged_path in staged.items():
+                    target = self.minute_symbol_year_path(frequency, symbol, year)
+                    staged_path.replace(target)
+                    installed.append(target)
+
+            con.execute("BEGIN TRANSACTION")
+            for entry in entries:
+                frequency = str(entry["frequency"])
+                symbol = str(entry["symbol"])
+                years = sorted(entry["staged"])
+                if entry.get("replace_symbol", True):
+                    con.execute(
+                        "DELETE FROM minute_partitions WHERE frequency = ? AND symbol = ?",
+                        [frequency, symbol],
+                    )
+                elif years:
+                    placeholders = ",".join("?" for _ in years)
+                    con.execute(
+                        "DELETE FROM minute_partitions WHERE frequency = ? AND symbol = ? "
+                        f"AND year IN ({placeholders})",
+                        [frequency, symbol, *years],
+                    )
+                for year in years:
+                    stat = entry["statistics"][year]
+                    target = self.minute_symbol_year_path(frequency, symbol, year).resolve()
+                    con.execute(
+                        "INSERT INTO minute_partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            frequency,
+                            symbol,
+                            year,
+                            entry["asset_type"],
+                            str(target),
+                            stat["rows"],
+                            stat["min_time"],
+                            stat["max_time"],
+                            entry["source_hash"],
+                            datetime.now(),
+                        ],
+                    )
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            for path in installed:
+                path.unlink(missing_ok=True)
+            for backup, target in reversed(backups):
+                if backup.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    backup.replace(target)
+            raise
+        finally:
+            con.close()
+            shutil.rmtree(backup_root, ignore_errors=True)
 
     def read_minute(
         self,
@@ -430,7 +573,7 @@ class DataStore:
                 return pd.DataFrame()
             return con.execute(
                 """
-                SELECT * FROM read_parquet(?)
+                SELECT * FROM read_parquet(?, hive_partitioning = false)
                 WHERE bar_time >= ? AND bar_time <= ?
                 ORDER BY symbol, bar_time
                 """,
@@ -544,20 +687,28 @@ class DataStore:
                 ],
             )
 
-    def minute_imported(self, file_hash: str) -> bool:
+    def minute_imported(self, file_hash: str, frequency: str, asset_type: str) -> bool:
         with self.connect() as con:
             row = con.execute(
-                "SELECT status FROM minute_imports WHERE file_hash = ?", [file_hash]
+                """
+                SELECT status FROM minute_archive_imports
+                WHERE file_hash = ? AND frequency = ? AND asset_type = ?
+                """,
+                [file_hash, frequency, asset_type],
             ).fetchone()
         return bool(row and row[0] == "success")
 
     def record_minute_import(self, values: dict[str, Any]) -> None:
         with self.connect() as con:
-            con.execute("DELETE FROM minute_imports WHERE file_hash = ?", [values["file_hash"]])
             con.execute(
-                "INSERT INTO minute_imports VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO minute_archive_imports
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 [
                     values["file_hash"],
+                    values["frequency"],
+                    values["asset_type"],
                     values["file_name"],
                     datetime.now(),
                     values.get("rows", 0),
