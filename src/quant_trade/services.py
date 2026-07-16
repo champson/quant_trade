@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -10,6 +10,26 @@ from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
 from quant_trade.models import AssetType, DataRequest, Dataset, Frequency
 from quant_trade.strategies import get_strategy
+
+
+# A cache only covers the request when its first row is within the longest
+# A-share holiday span of the requested start and the rows are dense enough to
+# be a real daily series rather than scattered snapshot dates.
+_HEAD_TOLERANCE_DAYS = 12
+_MIN_TRADING_DENSITY = 0.6
+
+
+def _cached_range_state(cached: pd.DataFrame, start: date, end: date) -> tuple[bool, date]:
+    """Return (fully_covered, fetch_start) for a cached daily series."""
+    days = pd.to_datetime(cached["trade_date"]).dt.date
+    first, last = days.min(), days.max()
+    span = pd.bdate_range(first, last)
+    dense = len(span) == 0 or days.nunique() >= _MIN_TRADING_DENSITY * len(span)
+    if not dense or (first - start).days > _HEAD_TOLERANCE_DAYS:
+        return False, start
+    if last >= end:
+        return True, start
+    return False, max(start, last + timedelta(days=1))
 
 
 def update_bars(
@@ -33,10 +53,9 @@ def update_bars(
         if resume and group:
             cached = store.read_daily(group, str(start), str(end))
             if not cached.empty:
-                last = cached["trade_date"].max().date()
-                if last >= end:
+                covered, fetch_start = _cached_range_state(cached, start, end)
+                if covered:
                     continue
-                fetch_start = max(start, last + pd.Timedelta(days=1))
         batch = router.fetch(DataRequest(
             dataset=Dataset.BARS, symbols=tuple(group), start=fetch_start, end=end,
             frequency=Frequency.DAY, asset_type=asset_type, provider=provider,
