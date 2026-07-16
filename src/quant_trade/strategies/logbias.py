@@ -23,6 +23,8 @@ class LogBiasStrategy(Strategy):
         held = pd.Series(False, index=prices.columns)
         for date in prices.index:
             value = bias.loc[date]
+            # Overheat only blocks new entries; existing holdings stay until
+            # bias falls to the stop level. This asymmetry is intentional.
             held = ((held & (value > stop)) | ((value >= entry) & (value < overheat))).fillna(False)
             selected = held[held].index
             if len(selected):

@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from quant_trade.config import RetryConfig
-from quant_trade.data.base import DataProvider, PermanentProviderError
+from quant_trade.data.base import DataProvider, EmptyDataError, PermanentProviderError
 from quant_trade.data.retry import retry_call
 from quant_trade.data.router import DataRouter
 from quant_trade.models import DataBatch, DataRequest, Dataset
@@ -44,6 +44,18 @@ def test_permanent_error_is_not_retried():
     assert len(calls) == 1
 
 
+def test_empty_data_is_not_retried():
+    calls = []
+
+    def operation():
+        calls.append(1)
+        raise EmptyDataError("返回空行情")
+
+    with pytest.raises(EmptyDataError):
+        retry_call(operation, RetryConfig(attempts=6, delays=[0] * 6), sleep=lambda _: None)
+    assert len(calls) == 1
+
+
 class FakeProvider(DataProvider):
     def __init__(self, name: str, fail: bool):
         self.name, self.fail = name, fail
@@ -60,6 +72,34 @@ class FakeProvider(DataProvider):
             "close": [10.5], "volume": [100.0], "amount": [1000.0], "source": [self.name],
         })
         return DataBatch(data, self.name, request)
+
+
+class EmptyProvider(DataProvider):
+    def __init__(self, name: str):
+        self.name = name
+
+    def capabilities(self):
+        return {Dataset.BARS}
+
+    def fetch(self, request):
+        raise EmptyDataError("返回空行情")
+
+
+def test_router_falls_back_on_empty_without_tripping_circuit(app_config):
+    app_config.providers.priority = ["first", "second"]
+    app_config.providers.retry.circuit_failures = 1
+    router = DataRouter(app_config, {
+        "first": EmptyProvider("first"),
+        "second": FakeProvider("second", False),
+    })
+    batch = router.fetch(DataRequest(
+        dataset=Dataset.BARS, symbols=("000001.SZ",),
+        start=date(2024, 1, 1), end=date(2024, 1, 2),
+    ))
+    assert batch.provider == "second"
+    # A single failure trips the breaker at threshold 1, so "first" staying
+    # available proves the empty result was not counted as a failure.
+    assert router.circuit.allow("first")
 
 
 def test_router_records_explicit_fallback(app_config):

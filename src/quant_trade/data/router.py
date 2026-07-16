@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quant_trade.config import AppConfig
-from quant_trade.data.base import DataProvider, PermanentProviderError, ProviderError
+from quant_trade.data.base import (
+    DataProvider,
+    EmptyDataError,
+    PermanentProviderError,
+    ProviderError,
+)
 from quant_trade.data.quality import validate_bars
 from quant_trade.data.retry import CircuitBreaker, retry_call
 from quant_trade.data.storage import DataStore
@@ -61,6 +66,10 @@ class DataRouter:
                     )
                 return batch
             except PermanentProviderError as exc:
+                errors.append(f"{name}: {exc}")
+            except EmptyDataError as exc:
+                # No rows is not a provider fault; fall back without
+                # counting it against the circuit breaker.
                 errors.append(f"{name}: {exc}")
             except Exception as exc:
                 self.circuit.failure(name)

@@ -8,7 +8,7 @@ from threading import Lock
 from typing import TypeVar
 
 from quant_trade.config import RetryConfig
-from quant_trade.data.base import PermanentProviderError, TransientProviderError
+from quant_trade.data.base import EmptyDataError, PermanentProviderError, TransientProviderError
 
 T = TypeVar("T")
 
@@ -95,6 +95,10 @@ def retry_call(
         try:
             return operation()
         except PermanentProviderError:
+            raise
+        except EmptyDataError:
+            # An empty result is deterministic; retrying only burns the backoff
+            # budget before the router can fall back.
             raise
         except Exception as raw:
             exc = raw if isinstance(raw, TransientProviderError) else classify_provider_exception(raw)
