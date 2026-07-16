@@ -41,6 +41,7 @@ backtest:
 strategies:
   etf_rotation:
     enabled: true
+    adjustment: hfq
     symbols: [512800.SH, 515030.SH, 515790.SH, 513100.SH, 518880.SH]
     momentum_windows: [20, 60]
     ma_window: 28
@@ -49,6 +50,7 @@ strategies:
     benchmark: 510300.SH
   logbias:
     enabled: true
+    adjustment: hfq
     symbols: [512800.SH, 515030.SH, 515790.SH]
     ema_window: 20
     entry: 5.0

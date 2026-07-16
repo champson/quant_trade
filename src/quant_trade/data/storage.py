@@ -67,6 +67,7 @@ class DataStore:
                     finished_at TIMESTAMP, status VARCHAR, as_of VARCHAR,
                     config_json VARCHAR, details VARCHAR
                 );
+                ALTER TABLE data_fetches ADD COLUMN IF NOT EXISTS adjustment VARCHAR;
                 """
             )
 
@@ -87,23 +88,37 @@ class DataStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
 
+    @staticmethod
+    def _with_adjustment(df: pd.DataFrame) -> pd.DataFrame:
+        """Rows written before the adjustment column existed count as unadjusted."""
+        if "adjustment" not in df:
+            df = df.assign(adjustment="none")
+        else:
+            df = df.copy()
+            df["adjustment"] = df["adjustment"].fillna("none")
+        return df
+
     def write_daily(self, df: pd.DataFrame, asset_type: str) -> int:
         count = 0
-        for symbol, part in df.groupby("symbol", sort=False):
+        for symbol, part in self._with_adjustment(df).groupby("symbol", sort=False):
             path = self.daily_path(asset_type, str(symbol))
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 old = pd.read_parquet(path)
-                part = pd.concat([old, part], ignore_index=True)
+                part = self._with_adjustment(pd.concat([old, part], ignore_index=True))
             part = part.sort_values("trade_date").drop_duplicates(
-                ["symbol", "trade_date"], keep="last"
+                ["symbol", "trade_date", "adjustment"], keep="last"
             )
             part.to_parquet(path, index=False)
             count += len(part)
         return count
 
     def read_daily(
-        self, symbols: list[str], start: str | None = None, end: str | None = None
+        self,
+        symbols: list[str],
+        start: str | None = None,
+        end: str | None = None,
+        adjustment: str = "none",
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         daily_root = self.root / "daily"
@@ -113,7 +128,8 @@ class DataStore:
                 frames.append(pd.read_parquet(path))
         if not frames:
             return pd.DataFrame()
-        out = pd.concat(frames, ignore_index=True)
+        out = self._with_adjustment(pd.concat(frames, ignore_index=True))
+        out = out[out["adjustment"] == adjustment]
         out["trade_date"] = pd.to_datetime(out["trade_date"])
         if start:
             out = out[out["trade_date"] >= pd.Timestamp(start)]
@@ -353,9 +369,15 @@ class DataStore:
     def record_fetch(self, **values: Any) -> None:
         with self.connect() as con:
             con.execute(
-                "INSERT INTO data_fetches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO data_fetches
+                    (fetched_at, dataset, provider, symbols, start_at, end_at,
+                     rows, status, warnings, adjustment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 [datetime.now(), values.get("dataset"), values.get("provider"),
                  values.get("symbols"), values.get("start"), values.get("end"),
                  values.get("rows", 0), values.get("status"),
-                 json.dumps(values.get("warnings", []), ensure_ascii=False)],
+                 json.dumps(values.get("warnings", []), ensure_ascii=False),
+                 values.get("adjustment", "none")],
             )

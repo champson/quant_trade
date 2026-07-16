@@ -41,6 +41,7 @@ class AkShareProvider(DataProvider):
             frames.append(normalize_daily(
                 raw, symbol=symbol, provider=self.name,
                 columns={"日期": "trade_date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount"},
+                adjustment=request.adjustment,
             ))
             time.sleep(self.interval_seconds)
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

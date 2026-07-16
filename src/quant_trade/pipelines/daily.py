@@ -96,13 +96,19 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
             )
 
         strategy_start = as_of - timedelta(days=420)
-        symbols_by_type: dict[AssetType, set[str]] = {AssetType.ETF: set()}
+        etf_symbols_by_adjustment: dict[str, set[str]] = {}
         for name, cfg in config.strategies.items():
             if cfg.get("enabled") and name != "microcap":
-                symbols_by_type[AssetType.ETF].update(cfg.get("symbols", []))
-        for asset_type, symbols in symbols_by_type.items():
+                group = etf_symbols_by_adjustment.setdefault(str(cfg.get("adjustment", "none")), set())
+                group.update(cfg.get("symbols", []))
+                if cfg.get("benchmark"):
+                    group.add(str(cfg["benchmark"]))
+        for adjustment, symbols in etf_symbols_by_adjustment.items():
             if symbols:
-                update_bars(config, router, store, sorted(symbols), strategy_start, as_of, asset_type, adjustment="hfq")
+                update_bars(
+                    config, router, store, sorted(symbols), strategy_start, as_of,
+                    AssetType.ETF, adjustment=adjustment,
+                )
 
         imported = MinuteArchiveImporter(config, store).import_inbox()
         result.minute_imports = [r.__dict__ for r in imported]

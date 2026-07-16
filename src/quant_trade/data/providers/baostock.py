@@ -77,6 +77,7 @@ class BaoStockProvider(DataProvider):
             frames.append(normalize_daily(
                 raw, symbol=symbol, provider=self.name,
                 columns={"date": "trade_date", "code": "provider_code"},
+                adjustment=request.adjustment,
             ))
             time.sleep(self.interval_seconds)
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

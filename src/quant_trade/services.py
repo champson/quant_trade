@@ -51,7 +51,7 @@ def update_bars(
         if resume and not group and start == end and store.market_snapshot_complete(asset_type.value, end):
             continue
         if resume and group:
-            cached = store.read_daily(group, str(start), str(end))
+            cached = store.read_daily(group, str(start), str(end), adjustment=adjustment)
             if not cached.empty:
                 covered, fetch_start = _cached_range_state(cached, start, end)
                 if covered:
@@ -78,13 +78,23 @@ def update_daily_basic(
     return batch.data
 
 
-def strategy_bars(store: DataStore, symbols: list[str], start: str | None, end: str | None) -> pd.DataFrame:
+def strategy_bars(
+    store: DataStore,
+    symbols: list[str],
+    start: str | None,
+    end: str | None,
+    adjustment: str = "none",
+) -> pd.DataFrame:
     if symbols:
-        data = store.read_daily(symbols, start, end)
+        data = store.read_daily(symbols, start, end, adjustment=adjustment)
     else:
         paths = list((store.root / "daily" / AssetType.STOCK.value).glob("*.parquet"))
         data = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True) if paths else pd.DataFrame()
         if not data.empty:
+            if "adjustment" in data:
+                data = data[data["adjustment"].fillna("none") == adjustment]
+            elif adjustment != "none":
+                data = data.iloc[0:0]
             data["trade_date"] = pd.to_datetime(data["trade_date"])
             if start:
                 data = data[data["trade_date"] >= pd.Timestamp(start)]
@@ -101,7 +111,7 @@ def strategy_bars(store: DataStore, symbols: list[str], start: str | None, end: 
 def run_strategy_signal(config: AppConfig, store: DataStore, name: str, as_of: str | None = None):
     cfg = config.strategies.get(name, {})
     symbols = list(cfg.get("symbols", []))
-    bars = strategy_bars(store, symbols, None, as_of)
+    bars = strategy_bars(store, symbols, None, as_of, str(cfg.get("adjustment", "none")))
     if name == "microcap":
         basic = store.read_daily_basic(None, as_of)
         bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
@@ -122,7 +132,8 @@ def run_strategy_backtest(
 ):
     cfg = config.strategies.get(name, {})
     symbols = list(cfg.get("symbols", []))
-    bars = strategy_bars(store, symbols, start, end)
+    adjustment = str(cfg.get("adjustment", "none"))
+    bars = strategy_bars(store, symbols, start, end, adjustment)
     if name == "microcap":
         basic = store.read_daily_basic(start, end)
         bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
@@ -139,7 +150,7 @@ def run_strategy_backtest(
     benchmark_name = cfg.get("benchmark")
     benchmark_equity = None
     if benchmark_name:
-        benchmark_bars = store.read_daily([benchmark_name], start, end)
+        benchmark_bars = store.read_daily([benchmark_name], start, end, adjustment=adjustment)
         if not benchmark_bars.empty:
             closes = benchmark_bars.sort_values("trade_date").set_index("trade_date")["close"]
             benchmark_equity = closes / closes.iloc[0] * execution.initial_cash

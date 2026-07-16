@@ -66,4 +66,5 @@ BAR_COLUMNS = [
     "volume",
     "amount",
     "source",
+    "adjustment",
 ]

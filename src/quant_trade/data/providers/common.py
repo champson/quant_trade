@@ -9,6 +9,7 @@ def normalize_daily(
     symbol: str,
     provider: str,
     columns: dict[str, str] | None = None,
+    adjustment: str = "none",
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -25,9 +26,10 @@ def normalize_daily(
         out[name] = pd.to_numeric(out[name], errors="coerce")
     out["bar_time"] = pd.NaT
     out["source"] = provider
+    out["adjustment"] = adjustment
     return out[
         ["symbol", "trade_date", "bar_time", "open", "high", "low", "close",
-         "volume", "amount", "source"]
+         "volume", "amount", "source", "adjustment"]
     ].dropna(subset=["trade_date", "open", "high", "low", "close"])
 
 

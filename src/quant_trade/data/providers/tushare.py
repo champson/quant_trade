@@ -22,6 +22,10 @@ class TushareProvider(DataProvider):
         return {Dataset.BARS, Dataset.DAILY_BASIC, Dataset.ADJ_FACTOR, Dataset.TRADE_CALENDAR}
 
     def supports(self, request: DataRequest) -> bool:
+        # Tushare bar endpoints return unadjusted prices only; adjusted
+        # requests must fall through to a provider that honours them.
+        if request.dataset == Dataset.BARS and request.adjustment != "none":
+            return False
         return super().supports(request) and request.frequency == Frequency.DAY
 
     def _api(self):
@@ -77,6 +81,7 @@ class TushareProvider(DataProvider):
             data = normalize_daily(
                 raw, symbol="", provider=self.name,
                 columns={"ts_code": "symbol", "vol": "volume"},
+                adjustment=request.adjustment,
             )
             if data.empty:
                 raise EmptyDataError("Tushare 返回空行情")
@@ -97,6 +102,7 @@ class TushareProvider(DataProvider):
                 symbol=symbol,
                 provider=self.name,
                 columns={"ts_code": "symbol", "vol": "volume"},
+                adjustment=request.adjustment,
             )
             frames.append(frame)
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

@@ -55,6 +55,7 @@ class DataRouter:
                         dataset=request.dataset.value,
                         provider=name,
                         symbols=",".join(request.symbols),
+                        adjustment=request.adjustment,
                         start=str(request.start), end=str(request.end), rows=len(batch.data),
                         status="success", warnings=batch.warnings,
                     )
@@ -67,7 +68,8 @@ class DataRouter:
         if self.store:
             self.store.record_fetch(
                 dataset=request.dataset.value, provider="none",
-                symbols=",".join(request.symbols), start=str(request.start), end=str(request.end),
+                symbols=",".join(request.symbols), adjustment=request.adjustment,
+                start=str(request.start), end=str(request.end),
                 rows=0, status="failed", warnings=errors,
             )
         raise ProviderError("所有数据源均失败: " + " | ".join(errors))
