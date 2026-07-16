@@ -22,8 +22,8 @@ Common CLI: `qt data update`, `qt data market-history`, `qt data minute import-d
 
 Layering (enforced — see docs/design.md §2): CLI/Dashboard → `pipelines/` (orchestration) → `services.py` (use cases) → `strategies/`, `backtest/`, `reports/`, `data/`.
 
-- **data/**: `router.py` routes requests across `providers/` in configured priority (tushare → baostock → akshare) with retry, per-provider circuit breaker, and fallback; every fetch is logged to the DuckDB `data_fetches` table. `storage.py` (`DataStore`) is Parquet files plus a DuckDB catalog (`data/quant_trade.duckdb`):
-  - Daily bars: `data/processed/daily/{asset_type}/{symbol}.parquet` (dots in symbols become underscores on disk).
+- **data/**: `router.py` routes requests across `providers/` in configured priority (tushare → baostock → akshare) with retry, per-provider circuit breaker, and fallback; it verifies returned bars carry the requested adjustment mode and logs every fetch to the DuckDB `data_fetches` table. `storage.py` (`DataStore`) is Parquet files plus a DuckDB catalog (`data/quant_trade.duckdb`):
+  - Daily bars: `data/processed/daily/{asset_type}/adjustment={mode}/{symbol}.parquet` (dots in symbols become underscores on disk). Per-trading-day coverage is tracked in the DuckDB `daily_coverage` table; `update_bars` consults the trade calendar (`data/calendar.py`) and refetches exactly the missing trading days.
   - Minute bars: `data/processed/minute/frequency=5min/symbol=000001_SZ/year=2025.parquet` (ZSTD). The DuckDB `minute_partitions` table is the catalog `read_minute` queries — Parquet files and catalog must stay in sync (`qt data minute verify` checks this).
   - Minute data comes only from file imports (`minute_archive.py` for ZIP inbox, `minute_directory.py` for read-only directory import with hash/mtime resume and atomic per-symbol commit); providers only serve daily frequency.
 - **strategies/**: subclass `Strategy` (`base.py`), implement `generate_targets(bars) → DataFrame` of target weights indexed by signal date. Register by editing the hardcoded `REGISTRY` dict in `registry.py` — there is no auto-discovery. Strategies must not fetch data, manage caches, or render output.
@@ -35,7 +35,7 @@ Layering (enforced — see docs/design.md §2): CLI/Dashboard → `pipelines/` (
 
 - **No look-ahead**: close-generated targets execute at the *next* available bar's open, never same-day. Tested in `tests/test_backtest_strategies.py`; do not weaken.
 - **Report credibility** (docs/design.md §5): reports state only what the engine actually models. Unmodeled effects (limit-up/down and halts, T+1, 100-share lots, announcement timing, survivorship bias) must stay explicitly labeled as such — never fake them. Trades are unpaired order flow, so per-trade win rate / profit-loss ratio / holding period must not be reported as automated metrics.
-- **Adjustment (复权) contract**: daily bars are stored and read per adjustment mode (`adjustment` column; `read_daily(..., adjustment=)`). Tushare does not serve adjusted bars — the router falls back to a provider that does. Never mix adjustment modes in one series.
+- **Adjustment (复权) contract**: `Adjustment` is an enum (`none`/`qfq`/`hfq`) validated at `DataRequest` construction. Daily bars are physically partitioned by asset type and adjustment mode, and `read_daily` requires both (`asset_type=` keyword, `adjustment=`). Tushare does not serve adjusted bars — the router falls back to a provider that does. Never mix adjustment modes in one series.
 - Microcap strategy requires point-in-time `total_mv` (previous day via `.shift(1)`).
 - Minute import: source files are read-only; 5-min data may aggregate upward but must never fabricate 1-min bars; ETF `09:31` placeholder rows are filtered; stock 09:30 auction bars kept with `is_auction=true`.
 

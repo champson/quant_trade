@@ -33,6 +33,12 @@ qt dashboard
 所有产物写入 `artifacts/`，运行状态写入 `runs/` 和 DuckDB。分钟 ZIP 放入
 `data/inbox/minute/` 后运行导入命令；成功文件归档，失败文件进入隔离目录。
 
+日线缓存按 `资产类型/复权方式` 隔离。旧版 `data/processed/daily/<资产类型>/*.parquet`
+不会自动迁移，因为其中可能混有不同复权价格；升级后首次执行数据更新会重新下载到
+`adjustment=none|qfq|hfq/` 子目录，确认新缓存完整后可自行归档旧文件。
+交易日历和明确的空行情日期缓存在 DuckDB，完整缓存更新可离线运行；部分成功响应遗漏的
+日期仍会继续补取。全市场快照只支持 `adjustment=none`。
+
 回测会在 `artifacts/backtests/<策略名>/` 同时生成自包含的 `report.html`、可归档的
 `report.md`、净值与月度图表，以及权益、持仓、成交和指标明细。`qt dashboard` 会把完整
 HTML 报告直接集成到回测页面。
@@ -51,6 +57,7 @@ data/processed/minute/
 
 输出使用ZSTD压缩。导入状态、文件哈希、过滤数量和分区路径记录在DuckDB；再次运行时，
 文件大小和修改时间未变化的证券会直接跳过。`--force` 可强制重建。
+空文件、仅表头文件和过滤后为空的源文件不会清除已经导入的证券分区。
 
 导入会过滤ETF的 `09:31 + OHLC全为1 + 零成交` 占位行，保留股票09:30集合竞价并设置
 `is_auction=true`。5分钟数据可以向上聚合，不能用来生成真实1分钟行情。

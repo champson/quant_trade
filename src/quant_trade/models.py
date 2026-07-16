@@ -24,6 +24,12 @@ class Frequency(StrEnum):
     DAY = "1d"
 
 
+class Adjustment(StrEnum):
+    NONE = "none"
+    QFQ = "qfq"
+    HFQ = "hfq"
+
+
 class Dataset(StrEnum):
     BARS = "bars"
     DAILY_BASIC = "daily_basic"
@@ -39,9 +45,12 @@ class DataRequest:
     end: date | datetime | None = None
     frequency: Frequency = Frequency.DAY
     asset_type: AssetType = AssetType.STOCK
-    adjustment: str = "none"
+    adjustment: Adjustment = Adjustment.NONE
     provider: str = "auto"
     fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "adjustment", Adjustment(self.adjustment))
 
 
 @dataclass

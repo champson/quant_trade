@@ -18,6 +18,7 @@ def save_market_review(
     bias: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -30,7 +31,12 @@ def save_market_review(
     pd.Series(review.summary).to_json(summary_path, force_ascii=False, indent=2)
     fig, ax = plt.subplots(figsize=(10, 4.8))
     ax.axis("off")
-    table = ax.table(cellText=review.breadth.values, colLabels=review.breadth.columns, loc="center", cellLoc="center")
+    table = ax.table(
+        cellText=review.breadth.values,
+        colLabels=review.breadth.columns,
+        loc="center",
+        cellLoc="center",
+    )
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.scale(1, 1.5)

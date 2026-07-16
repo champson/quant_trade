@@ -30,11 +30,28 @@ def _write_dataset(root: Path) -> None:
         encoding="utf-8-sig",
     )
     (root / "index" / "000001.SH.csv").write_text(HEADER, encoding="utf-8-sig")
-    pd.DataFrame([
-        {"category": "stock", "ts_code": "000001.SZ", "relative_file": "stock/000001.SZ.csv", "rows": 3},
-        {"category": "etf", "ts_code": "510300.SH", "relative_file": "etf/510300.SH.csv", "rows": 3},
-        {"category": "index", "ts_code": "000001.SH", "relative_file": "index/000001.SH.csv", "rows": 0},
-    ]).to_csv(root / "manifest.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [
+            {
+                "category": "stock",
+                "ts_code": "000001.SZ",
+                "relative_file": "stock/000001.SZ.csv",
+                "rows": 3,
+            },
+            {
+                "category": "etf",
+                "ts_code": "510300.SH",
+                "relative_file": "etf/510300.SH.csv",
+                "rows": 3,
+            },
+            {
+                "category": "index",
+                "ts_code": "000001.SH",
+                "relative_file": "index/000001.SH.csv",
+                "rows": 0,
+            },
+        ]
+    ).to_csv(root / "manifest.csv", index=False, encoding="utf-8-sig")
 
 
 def test_directory_import_is_flat_audited_and_resumable(app_config, tmp_path):
@@ -64,9 +81,7 @@ def test_directory_import_is_flat_audited_and_resumable(app_config, tmp_path):
     assert bool(stock.loc[stock["bar_time"].dt.strftime("%H:%M") == "09:30", "is_auction"].iloc[0])
     assert etf["bar_time"].dt.strftime("%H:%M").tolist() == ["09:35", "13:00"]
 
-    queried = store.read_minute(
-        ["000001.SZ"], "2024-01-02 09:00", "2024-01-02 10:00", "5min"
-    )
+    queried = store.read_minute(["000001.SZ"], "2024-01-02 09:00", "2024-01-02 10:00", "5min")
     assert len(queried) == 2
     assert queried["asset_type"].unique().tolist() == ["stock"]
 
@@ -91,3 +106,46 @@ def test_directory_import_rejects_conflicting_duplicate(app_config, tmp_path):
     assert result.status == "partial_failed"
     assert result.files_failed == 1
     assert "冲突" in result.failures[0]["error"]
+
+
+def test_empty_source_does_not_delete_existing_partitions(app_config, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    path = source / "000001.SZ.csv"
+    path.write_text(
+        HEADER + "000001.SZ,2024-01-02 09:35:00,10,10,10,10,100,1000\n",
+        encoding="utf-8-sig",
+    )
+    manifest = source / "manifest.csv"
+    pd.DataFrame(
+        [
+            {
+                "category": "stock",
+                "ts_code": "000001.SZ",
+                "relative_file": path.name,
+                "rows": 1,
+            }
+        ]
+    ).to_csv(manifest, index=False, encoding="utf-8-sig")
+    store = DataStore(app_config)
+    importer = MinuteDirectoryImporter(app_config, store)
+    first = importer.import_directory(source, "5min")
+    partition = store.minute_symbol_year_path("5min", "000001.SZ", 2024)
+    assert first.files_success == 1
+    assert partition.exists()
+
+    path.write_text(HEADER, encoding="utf-8-sig")
+    pd.DataFrame(
+        [
+            {
+                "category": "stock",
+                "ts_code": "000001.SZ",
+                "relative_file": path.name,
+                "rows": 0,
+            }
+        ]
+    ).to_csv(manifest, index=False, encoding="utf-8-sig")
+    second = importer.import_directory(source, "5min", resume=False)
+    assert second.files_empty == 1
+    assert partition.exists()
+    assert len(pd.read_parquet(partition)) == 1

@@ -68,30 +68,42 @@ def run_weight_backtest(
     trades: list[dict] = []
     dates = opens.index
     last_desired: pd.Series | None = None
+    pending_symbols: set[str] = set()
 
     for current in dates:
         open_px = opens.loc[current]
         # A signal observed at the previous bar close can only trade now.
         previous_dates = targets.index[targets.index < current]
         desired = targets.loc[previous_dates[-1]] if len(previous_dates) else None
-        changed = desired is not None and (
+        signal_changed = desired is not None and (
             last_desired is None or not desired.equals(last_desired)
         )
-        if changed:
+        should_trade = desired is not None and (signal_changed or bool(pending_symbols))
+        if should_trade:
             mark_open = open_px.fillna(previous_marks.loc[current])
             portfolio_open = cash + float((shares * mark_open.fillna(0)).sum())
             current_value = shares * mark_open
             desired_value = desired * portfolio_open
             deltas = desired_value - current_value
             # Sell first so sale proceeds are available for buys.
-            order = list(deltas[deltas < -1e-9].index) + list(deltas[deltas > 1e-9].index)
+            candidates = (
+                deltas.index if signal_changed else deltas.index[deltas.index.isin(pending_symbols)]
+            )
+            retry_deltas = deltas.loc[candidates]
+            order = list(retry_deltas[retry_deltas < -1e-9].index) + list(
+                retry_deltas[retry_deltas > 1e-9].index
+            )
+            next_pending: set[str] = set()
             for symbol in order:
                 price = open_px.get(symbol)
                 if pd.isna(price) or price <= 0:
+                    next_pending.add(symbol)
                     continue
                 delta_value = float(deltas[symbol])
                 side = "BUY" if delta_value > 0 else "SELL"
-                exec_price = float(price) * (1 + config.slippage_rate if side == "BUY" else 1 - config.slippage_rate)
+                exec_price = float(price) * (
+                    1 + config.slippage_rate if side == "BUY" else 1 - config.slippage_rate
+                )
                 quantity = abs(delta_value) / exec_price
                 if config.lot_size > 1:
                     quantity = np.floor(quantity / config.lot_size) * config.lot_size
@@ -112,11 +124,20 @@ def run_weight_backtest(
                 else:
                     cash += notional - commission - tax
                     shares[symbol] -= quantity
-                trades.append({
-                    "date": current, "signal_date": previous_dates[-1], "symbol": symbol,
-                    "side": side, "quantity": quantity, "price": exec_price,
-                    "notional": notional, "commission": commission, "tax": tax,
-                })
+                trades.append(
+                    {
+                        "date": current,
+                        "signal_date": previous_dates[-1],
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": exec_price,
+                        "notional": notional,
+                        "commission": commission,
+                        "tax": tax,
+                    }
+                )
+            pending_symbols = next_pending
             last_desired = desired.copy()
         mark_close = marks.loc[current].fillna(0)
         equity = cash + float((shares * mark_close).sum())

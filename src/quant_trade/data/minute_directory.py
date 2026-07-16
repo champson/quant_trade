@@ -112,13 +112,15 @@ class MinuteDirectoryImporter:
         for row in frame.to_dict("records"):
             category = row["category"].strip().lower()
             rows = int(row["rows"]) if row.get("rows", "").strip().isdigit() else None
-            sources.append(DirectorySource(
-                path=root / row["relative_file"],
-                relative_path=row["relative_file"],
-                symbol=self._normalize_symbol(row["ts_code"]),
-                asset_type=ASSET_TYPES.get(category, category),
-                expected_rows=rows,
-            ))
+            sources.append(
+                DirectorySource(
+                    path=root / row["relative_file"],
+                    relative_path=row["relative_file"],
+                    symbol=self._normalize_symbol(row["ts_code"]),
+                    asset_type=ASSET_TYPES.get(category, category),
+                    expected_rows=rows,
+                )
+            )
         return sources, manifest
 
     def discover(self, root: str | Path) -> tuple[list[DirectorySource], Path | None]:
@@ -134,12 +136,14 @@ class MinuteDirectoryImporter:
                 continue
             relative = path.relative_to(root)
             category = relative.parts[0].lower() if len(relative.parts) > 1 else ""
-            discovered.append(DirectorySource(
-                path=path,
-                relative_path=str(relative),
-                symbol=self._normalize_symbol(path.stem),
-                asset_type=ASSET_TYPES.get(category, "unknown"),
-            ))
+            discovered.append(
+                DirectorySource(
+                    path=path,
+                    relative_path=str(relative),
+                    symbol=self._normalize_symbol(path.stem),
+                    asset_type=ASSET_TYPES.get(category, "unknown"),
+                )
+            )
         if not discovered:
             raise DataQualityError("目录中没有证券CSV")
         return discovered, None
@@ -177,9 +181,14 @@ class MinuteDirectoryImporter:
             if source.asset_type not in ASSET_TYPES.values():
                 unknown.append(source.relative_path)
         return DirectoryProfile(
-            root=str(root_path), files=len(sources), files_by_type=by_type,
-            expected_rows=expected_rows, manifest=str(manifest) if manifest else None,
-            bad_headers=bad_headers, missing_files=missing, unknown_asset_types=unknown,
+            root=str(root_path),
+            files=len(sources),
+            files_by_type=by_type,
+            expected_rows=expected_rows,
+            manifest=str(manifest) if manifest else None,
+            bad_headers=bad_headers,
+            missing_files=missing,
+            unknown_asset_types=unknown,
         )
 
     def _encoding_and_mapping(self, path: Path) -> tuple[str, dict[str, str]]:
@@ -217,9 +226,8 @@ class MinuteDirectoryImporter:
         auction = asset_type == "stock" and clock_minutes.eq(9 * 60 + 30)
         am_elapsed = clock_minutes - (9 * 60 + 30)
         pm_elapsed = clock_minutes - (13 * 60)
-        regular = (
-            ((am_elapsed > 0) & (am_elapsed <= 120) & am_elapsed.mod(minutes).eq(0))
-            | ((pm_elapsed >= 0) & (pm_elapsed <= 120) & pm_elapsed.mod(minutes).eq(0))
+        regular = ((am_elapsed > 0) & (am_elapsed <= 120) & am_elapsed.mod(minutes).eq(0)) | (
+            (pm_elapsed >= 0) & (pm_elapsed <= 120) & pm_elapsed.mod(minutes).eq(0)
         )
         invalid = ~(regular | auction)
         if invalid.any():
@@ -232,7 +240,9 @@ class MinuteDirectoryImporter:
         if not duplicate.any():
             return frame, 0
         values = ["open", "high", "low", "close", "volume", "amount"]
-        conflicts = frame.loc[duplicate].groupby("bar_time")[values].nunique(dropna=False).max(axis=1) > 1
+        conflicts = (
+            frame.loc[duplicate].groupby("bar_time")[values].nunique(dropna=False).max(axis=1) > 1
+        )
         if conflicts.any():
             examples = conflicts[conflicts].index[:3].astype(str).tolist()
             raise DataQualityError(f"同时间K线数值冲突: {examples}")
@@ -276,29 +286,48 @@ class MinuteDirectoryImporter:
         frame["trade_date"] = frame["bar_time"].dt.date
         frame["asset_type"] = source.asset_type
         frame["frequency"] = frequency
-        frame["is_auction"] = (
-            (source.asset_type == "stock")
-            & frame["bar_time"].dt.strftime("%H:%M:%S").eq("09:30:00")
-        )
+        frame["is_auction"] = (source.asset_type == "stock") & frame["bar_time"].dt.strftime(
+            "%H:%M:%S"
+        ).eq("09:30:00")
         frame["source"] = "tushare_directory"
         validate_bars(frame.assign(trade_date=frame["trade_date"].astype(str)), minute=True)
-        return frame[[
-            "symbol", "asset_type", "frequency", "trade_date", "bar_time",
-            "open", "high", "low", "close", "volume", "amount",
-            "is_auction", "source",
-        ]], filtered
+        return frame[
+            [
+                "symbol",
+                "asset_type",
+                "frequency",
+                "trade_date",
+                "bar_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "is_auction",
+                "source",
+            ]
+        ], filtered
 
     @staticmethod
     def _arrow_schema() -> pa.Schema:
-        return pa.schema([
-            ("symbol", pa.string()), ("asset_type", pa.string()),
-            ("frequency", pa.string()), ("trade_date", pa.date32()),
-            ("bar_time", pa.timestamp("ns")), ("open", pa.float64()),
-            ("high", pa.float64()), ("low", pa.float64()),
-            ("close", pa.float64()), ("volume", pa.float64()),
-            ("amount", pa.float64()), ("is_auction", pa.bool_()),
-            ("source", pa.string()),
-        ])
+        return pa.schema(
+            [
+                ("symbol", pa.string()),
+                ("asset_type", pa.string()),
+                ("frequency", pa.string()),
+                ("trade_date", pa.date32()),
+                ("bar_time", pa.timestamp("ns")),
+                ("open", pa.float64()),
+                ("high", pa.float64()),
+                ("low", pa.float64()),
+                ("close", pa.float64()),
+                ("volume", pa.float64()),
+                ("amount", pa.float64()),
+                ("is_auction", pa.bool_()),
+                ("source", pa.string()),
+            ]
+        )
 
     def _import_file(
         self,
@@ -322,8 +351,7 @@ class MinuteDirectoryImporter:
             )
         result = FileImportResult(source.relative_path, source.symbol, source.asset_type, "failed")
         staging = (
-            self.store.root / ".staging" / "minute" / run_id
-            / self.store.safe_symbol(source.symbol)
+            self.store.root / ".staging" / "minute" / run_id / self.store.safe_symbol(source.symbol)
         )
         staging.mkdir(parents=True, exist_ok=True)
         writers: dict[int, pq.ParquetWriter] = {}
@@ -334,16 +362,14 @@ class MinuteDirectoryImporter:
         try:
             encoding, mapping = self._encoding_and_mapping(source.path)
             if not mapping:
-                self.store.commit_minute_symbol(
-                    frequency=frequency, symbol=source.symbol,
-                    asset_type=source.asset_type, staged={}, statistics={},
-                    source_hash=file_hash,
-                )
                 result.status = "empty"
             else:
                 chunks = pd.read_csv(
-                    source.path, encoding=encoding, dtype=str,
-                    chunksize=self.config.minute.chunk_rows, low_memory=False,
+                    source.path,
+                    encoding=encoding,
+                    dtype=str,
+                    chunksize=self.config.minute.chunk_rows,
+                    low_memory=False,
                 )
                 for chunk in chunks:
                     result.rows_input += len(chunk)
@@ -370,21 +396,32 @@ class MinuteDirectoryImporter:
                     )
                     result.rows_written += len(frame)
                     current_min, current_max = frame["bar_time"].min(), frame["bar_time"].max()
-                    result.min_time = str(current_min) if result.min_time is None else str(min(pd.Timestamp(result.min_time), current_min))
-                    result.max_time = str(current_max) if result.max_time is None else str(max(pd.Timestamp(result.max_time), current_max))
+                    result.min_time = (
+                        str(current_min)
+                        if result.min_time is None
+                        else str(min(pd.Timestamp(result.min_time), current_min))
+                    )
+                    result.max_time = (
+                        str(current_max)
+                        if result.max_time is None
+                        else str(max(pd.Timestamp(result.max_time), current_max))
+                    )
                     for year, part in frame.groupby(frame["bar_time"].dt.year):
                         year = int(year)
                         path = staging / f"year={year}.parquet"
                         if year not in writers:
                             writers[year] = pq.ParquetWriter(
-                                path, self._arrow_schema(),
+                                path,
+                                self._arrow_schema(),
                                 compression=self.config.minute.compression,
                                 compression_level=self.config.minute.compression_level,
-                                use_dictionary=True, write_statistics=True,
+                                use_dictionary=True,
+                                write_statistics=True,
                             )
                             staged[year] = path
                             statistics[year] = {
-                                "rows": 0, "min_time": part["bar_time"].min(),
+                                "rows": 0,
+                                "min_time": part["bar_time"].min(),
                                 "max_time": part["bar_time"].max(),
                             }
                         table = pa.Table.from_pandas(
@@ -407,34 +444,58 @@ class MinuteDirectoryImporter:
                 for writer in writers.values():
                     writer.close()
                 writers.clear()
-                self.store.commit_minute_symbol(
-                    frequency=frequency, symbol=source.symbol,
-                    asset_type=source.asset_type, staged=staged,
-                    statistics=statistics, source_hash=file_hash,
-                )
-                result.status = "success" if result.rows_written else "empty"
-            self.store.record_minute_source({
-                "source_path": source_path, "frequency": frequency,
-                "symbol": source.symbol, "asset_type": source.asset_type,
-                "file_hash": file_hash, "file_size": stat.st_size,
-                "file_mtime_ns": stat.st_mtime_ns, "rows_input": result.rows_input,
-                "rows_written": result.rows_written,
-                "rows_filtered": result.rows_filtered, "min_time": result.min_time,
-                "max_time": result.max_time, "status": result.status,
-            })
+                if staged:
+                    self.store.commit_minute_symbol(
+                        frequency=frequency,
+                        symbol=source.symbol,
+                        asset_type=source.asset_type,
+                        staged=staged,
+                        statistics=statistics,
+                        source_hash=file_hash,
+                    )
+                    result.status = "success"
+                else:
+                    # An empty/truncated source is not proof that previously
+                    # imported history should be deleted.
+                    result.status = "empty"
+            self.store.record_minute_source(
+                {
+                    "source_path": source_path,
+                    "frequency": frequency,
+                    "symbol": source.symbol,
+                    "asset_type": source.asset_type,
+                    "file_hash": file_hash,
+                    "file_size": stat.st_size,
+                    "file_mtime_ns": stat.st_mtime_ns,
+                    "rows_input": result.rows_input,
+                    "rows_written": result.rows_written,
+                    "rows_filtered": result.rows_filtered,
+                    "min_time": result.min_time,
+                    "max_time": result.max_time,
+                    "status": result.status,
+                }
+            )
             return result
         except Exception as exc:
             result.error = str(exc)
             for writer in writers.values():
                 writer.close()
-            self.store.record_minute_source({
-                "source_path": source_path, "frequency": frequency,
-                "symbol": source.symbol, "asset_type": source.asset_type,
-                "file_hash": file_hash, "file_size": stat.st_size,
-                "file_mtime_ns": stat.st_mtime_ns, "rows_input": result.rows_input,
-                "rows_written": 0, "rows_filtered": result.rows_filtered,
-                "status": "failed", "error": result.error,
-            })
+            self.store.record_minute_source(
+                {
+                    "source_path": source_path,
+                    "frequency": frequency,
+                    "symbol": source.symbol,
+                    "asset_type": source.asset_type,
+                    "file_hash": file_hash,
+                    "file_size": stat.st_size,
+                    "file_mtime_ns": stat.st_mtime_ns,
+                    "rows_input": result.rows_input,
+                    "rows_written": 0,
+                    "rows_filtered": result.rows_filtered,
+                    "status": "failed",
+                    "error": result.error,
+                }
+            )
             return result
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -471,11 +532,17 @@ class MinuteDirectoryImporter:
             result.rows_filtered += item.rows_filtered
             if progress:
                 progress(index, len(sources), item)
-        self.store.finish_minute_import_run(run_id, {
-            "status": result.status, "files_success": result.files_success,
-            "files_skipped": result.files_skipped, "files_empty": result.files_empty,
-            "files_failed": result.files_failed, "rows_written": result.rows_written,
-            "rows_filtered": result.rows_filtered,
-            "details": {"failures": result.failures[:100]},
-        })
+        self.store.finish_minute_import_run(
+            run_id,
+            {
+                "status": result.status,
+                "files_success": result.files_success,
+                "files_skipped": result.files_skipped,
+                "files_empty": result.files_empty,
+                "files_failed": result.files_failed,
+                "rows_written": result.rows_written,
+                "rows_filtered": result.rows_filtered,
+                "details": {"failures": result.failures[:100]},
+            },
+        )
         return result

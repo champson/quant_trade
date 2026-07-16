@@ -7,7 +7,7 @@ import pandas as pd
 from quant_trade.config import Secrets
 from quant_trade.data.base import DataProvider, EmptyDataError, PermanentProviderError
 from quant_trade.data.providers.common import normalize_daily, ymd
-from quant_trade.models import AssetType, DataBatch, DataRequest, Dataset, Frequency
+from quant_trade.models import Adjustment, AssetType, DataBatch, DataRequest, Dataset, Frequency
 
 
 class TushareProvider(DataProvider):
@@ -24,7 +24,7 @@ class TushareProvider(DataProvider):
     def supports(self, request: DataRequest) -> bool:
         # Tushare bar endpoints return unadjusted prices only; adjusted
         # requests must fall through to a provider that honours them.
-        if request.dataset == Dataset.BARS and request.adjustment != "none":
+        if request.dataset == Dataset.BARS and request.adjustment != Adjustment.NONE:
             return False
         return super().supports(request) and request.frequency == Frequency.DAY
 
@@ -55,7 +55,11 @@ class TushareProvider(DataProvider):
             frames = []
             if request.symbols:
                 for symbol in request.symbols:
-                    frames.append(pro.daily_basic(ts_code=symbol, start_date=ymd(request.start), end_date=ymd(request.end)))
+                    frames.append(
+                        pro.daily_basic(
+                            ts_code=symbol, start_date=ymd(request.start), end_date=ymd(request.end)
+                        )
+                    )
                     time.sleep(self.interval_seconds)
             else:
                 frames.append(pro.daily_basic(trade_date=ymd(request.end)))
@@ -64,7 +68,11 @@ class TushareProvider(DataProvider):
         if request.dataset == Dataset.ADJ_FACTOR:
             frames = []
             for symbol in request.symbols:
-                frames.append(pro.adj_factor(ts_code=symbol, start_date=ymd(request.start), end_date=ymd(request.end)))
+                frames.append(
+                    pro.adj_factor(
+                        ts_code=symbol, start_date=ymd(request.start), end_date=ymd(request.end)
+                    )
+                )
                 time.sleep(self.interval_seconds)
             df = pd.concat([x for x in frames if x is not None], ignore_index=True)
             return DataBatch(df, self.name, request)
@@ -79,13 +87,20 @@ class TushareProvider(DataProvider):
             )
             time.sleep(self.interval_seconds)
             data = normalize_daily(
-                raw, symbol="", provider=self.name,
+                raw,
+                symbol="",
+                provider=self.name,
                 columns={"ts_code": "symbol", "vol": "volume"},
                 adjustment=request.adjustment,
             )
             if data.empty:
                 raise EmptyDataError("Tushare 返回空行情")
-            return DataBatch(data.sort_values(["trade_date", "symbol"]), self.name, request)
+            return DataBatch(
+                data.sort_values(["trade_date", "symbol"]),
+                self.name,
+                request,
+                metadata={"adjustment_evidence": "unadjusted_endpoint"},
+            )
         for symbol in symbols:
             kwargs = dict(ts_code=symbol, start_date=ymd(request.start), end_date=ymd(request.end))
             if request.asset_type == AssetType.ETF:
@@ -108,4 +123,9 @@ class TushareProvider(DataProvider):
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if data.empty:
             raise EmptyDataError("Tushare 返回空行情")
-        return DataBatch(data.sort_values(["trade_date", "symbol"]), self.name, request)
+        return DataBatch(
+            data.sort_values(["trade_date", "symbol"]),
+            self.name,
+            request,
+            metadata={"adjustment_evidence": "unadjusted_endpoint"},
+        )

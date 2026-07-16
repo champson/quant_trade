@@ -39,9 +39,7 @@ class MinuteConfig(BaseModel):
     encoding_candidates: list[str] = Field(
         default_factory=lambda: ["utf-8-sig", "utf-8", "gb18030", "gbk"]
     )
-    filename_symbol_regex: str = (
-        r"(?P<symbol>\d{6})(?:[._-]?(?P<exchange>SH|SZ|BJ))?"
-    )
+    filename_symbol_regex: str = r"(?P<symbol>\d{6})(?:[._-]?(?P<exchange>SH|SZ|BJ))?"
     timestamp_convention: str = "source"
     compression: str = "zstd"
     compression_level: int = 6

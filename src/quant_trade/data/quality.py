@@ -29,4 +29,3 @@ def validate_bars(df: pd.DataFrame, *, minute: bool = False) -> list[str]:
     if df["amount"].isna().mean() > 0.2 if "amount" in df else False:
         warnings.append("超过20%的成交额为空")
     return warnings
-

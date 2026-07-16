@@ -10,6 +10,7 @@ BUCKETS = [
     ("上涨5%-7%", 0.05, 0.07),
     ("上涨3%-5%", 0.03, 0.05),
     ("上涨0%-3%", 0.0, 0.03),
+    ("平盘", 0.0, 0.0),
     ("下跌0%-3%", -0.03, 0.0),
     ("下跌3%-5%", -0.05, -0.03),
     ("下跌5%-7%", -0.07, -0.05),
@@ -32,7 +33,9 @@ def _nearest_on_or_before(dates: pd.DatetimeIndex, target: pd.Timestamp) -> pd.T
     return eligible[-1]
 
 
-def build_market_review(bars: pd.DataFrame, as_of: str | pd.Timestamp | None = None) -> MarketReview:
+def build_market_review(
+    bars: pd.DataFrame, as_of: str | pd.Timestamp | None = None
+) -> MarketReview:
     if bars.empty:
         raise ValueError("没有市场行情可复盘")
     work = bars.copy()
@@ -57,19 +60,26 @@ def build_market_review(bars: pd.DataFrame, as_of: str | pd.Timestamp | None = N
         row = {"区间": label}
         for period in ret.columns:
             values = ret[period].dropna()
-            if lower == -float("inf"):
+            if lower == upper == 0.0:
+                mask = values == 0.0
+            elif lower == -float("inf"):
                 mask = values <= upper
             elif upper == float("inf"):
                 mask = values > lower
+            elif upper == 0.0:
+                mask = (values > lower) & (values < upper)
             else:
                 mask = (values > lower) & (values <= upper)
             row[period] = int(mask.sum())
         rows.append(row)
     day = ret["当天"].dropna()
     summary = {
-        "as_of": str(latest.date()), "stocks": int(len(day)),
-        "up": int((day > 0).sum()), "down": int((day < 0).sum()),
-        "flat": int((day == 0).sum()), "median_return": float(day.median()),
+        "as_of": str(latest.date()),
+        "stocks": int(len(day)),
+        "up": int((day > 0).sum()),
+        "down": int((day < 0).sum()),
+        "flat": int((day == 0).sum()),
+        "median_return": float(day.median()),
         "mean_return": float(day.mean()),
     }
     return MarketReview(latest, pd.DataFrame(rows), summary, ret)
@@ -90,7 +100,13 @@ def portfolio_returns(
 
     def normalize(code: str) -> str:
         value = str(code).strip().split(".")[0].zfill(6)
-        exchange = "SH" if value.startswith(("5", "6", "9")) else "BJ" if value.startswith(("4", "8")) else "SZ"
+        exchange = (
+            "SH"
+            if value.startswith(("5", "6", "9"))
+            else "BJ"
+            if value.startswith(("4", "8"))
+            else "SZ"
+        )
         return f"{value}.{exchange}"
 
     holdings["symbol"] = holdings[code_col].map(normalize)
@@ -103,7 +119,9 @@ def portfolio_returns(
     return ret.loc[available.index].mul(available, axis=0).sum().rename("portfolio")
 
 
-def asset_return_summary(bars: pd.DataFrame, as_of: str | pd.Timestamp | None = None) -> pd.DataFrame:
+def asset_return_summary(
+    bars: pd.DataFrame, as_of: str | pd.Timestamp | None = None
+) -> pd.DataFrame:
     ret = period_returns(bars, as_of)
     return pd.DataFrame({"等权平均": ret.mean(), "中位数": ret.median(), "数量": ret.count()}).T
 

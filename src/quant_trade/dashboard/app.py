@@ -27,7 +27,11 @@ def main() -> None:
         if summary:
             values = json.loads(summary.read_text(encoding="utf-8"))
             cols = st.columns(5)
-            for col, key, label in zip(cols, ["stocks", "up", "down", "mean_return", "median_return"], ["股票数", "上涨", "下跌", "平均涨幅", "中位涨幅"]):
+            for col, key, label in zip(
+                cols,
+                ["stocks", "up", "down", "mean_return", "median_return"],
+                ["股票数", "上涨", "下跌", "平均涨幅", "中位涨幅"],
+            ):
                 value = values.get(key, "-")
                 if key.endswith("return") and isinstance(value, (float, int)):
                     value = f"{value:.2%}"
@@ -60,21 +64,38 @@ def main() -> None:
         if cfg.paths.database.exists():
             con = duckdb.connect(str(cfg.paths.database), read_only=True)
             st.subheader("最近运行")
-            st.dataframe(con.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").df(), use_container_width=True)
+            st.dataframe(
+                con.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").df(),
+                use_container_width=True,
+            )
             st.subheader("数据源请求")
-            st.dataframe(con.execute("SELECT * FROM data_fetches ORDER BY fetched_at DESC LIMIT 50").df(), use_container_width=True)
+            st.dataframe(
+                con.execute("SELECT * FROM data_fetches ORDER BY fetched_at DESC LIMIT 50").df(),
+                use_container_width=True,
+            )
             st.subheader("分钟文件导入")
-            st.dataframe(con.execute("SELECT * FROM minute_imports ORDER BY imported_at DESC LIMIT 50").df(), use_container_width=True)
+            st.dataframe(
+                con.execute("SELECT * FROM minute_imports ORDER BY imported_at DESC LIMIT 50").df(),
+                use_container_width=True,
+            )
             st.subheader("分钟目录导入")
-            st.dataframe(con.execute("SELECT * FROM minute_import_runs ORDER BY started_at DESC LIMIT 30").df(), use_container_width=True)
+            st.dataframe(
+                con.execute(
+                    "SELECT * FROM minute_import_runs ORDER BY started_at DESC LIMIT 30"
+                ).df(),
+                use_container_width=True,
+            )
             st.subheader("分钟数据覆盖")
-            st.dataframe(con.execute("""
+            st.dataframe(
+                con.execute("""
                 SELECT frequency, asset_type, COUNT(DISTINCT symbol) AS symbols,
                        SUM(rows) AS rows, MIN(min_time) AS min_time,
                        MAX(max_time) AS max_time
                 FROM minute_partitions
                 GROUP BY frequency, asset_type ORDER BY frequency, asset_type
-            """).df(), use_container_width=True)
+            """).df(),
+                use_container_width=True,
+            )
             con.close()
         else:
             st.info("数据库尚未创建")

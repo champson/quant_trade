@@ -13,7 +13,11 @@ class MicrocapStrategy(Strategy):
             raise ValueError("微盘股策略需要 point-in-time total_mv 字段")
         work = bars.copy()
         work["trade_date"] = pd.to_datetime(work["trade_date"])
-        mv = work.pivot(index="trade_date", columns="symbol", values="total_mv").sort_index().shift(1)
+        mv = (
+            work.pivot(index="trade_date", columns="symbol", values="total_mv")
+            .sort_index()
+            .shift(1)
+        )
         prices = work.pivot(index="trade_date", columns="symbol", values="close").reindex(mv.index)
         pool_size = int(self.config.get("pool_size", self.config.get("count", 400)))
         hold_count = int(self.config.get("hold_count", pool_size))
@@ -36,7 +40,9 @@ class MicrocapStrategy(Strategy):
                 should_rebalance = True
             if should_rebalance:
                 values = mv.loc[date].where(prices.loc[date].notna()).dropna()
-                values = values[~values.index.to_series().str.split(".").str[0].str.startswith(prefixes)]
+                values = values[
+                    ~values.index.to_series().str.split(".").str[0].str.startswith(prefixes)
+                ]
                 pool = values.nsmallest(pool_size)
                 if selection == "rank":
                     picked = pool.iloc[rank_start - 1 : rank_start - 1 + hold_count]
@@ -46,7 +52,11 @@ class MicrocapStrategy(Strategy):
                     if location < lookback:
                         picked = pd.Series(dtype=float)
                     else:
-                        momentum = prices.loc[date, pool.index] / prices.iloc[location - lookback][pool.index] - 1
+                        momentum = (
+                            prices.loc[date, pool.index]
+                            / prices.iloc[location - lookback][pool.index]
+                            - 1
+                        )
                         rps = momentum.rank(pct=True) * 100
                         target = float(self.config.get("rps_target", 70))
                         picked = pool.reindex((rps - target).abs().nsmallest(hold_count).index)

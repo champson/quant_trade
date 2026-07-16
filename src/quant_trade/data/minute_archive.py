@@ -121,17 +121,17 @@ class MinuteArchiveImporter:
             mapping = self._mapping(header)
             required = {"open", "high", "low", "close", "volume"}
             if not required <= set(mapping.values()):
-                raise DataQualityError(
-                    "分钟 CSV 缺少 OHLCV 字段；检测到: " + ", ".join(header)
-                )
+                raise DataQualityError("分钟 CSV 缺少 OHLCV 字段；检测到: " + ", ".join(header))
             if "bar_time" not in mapping.values() and "trade_date" not in mapping.values():
                 raise DataQualityError("分钟 CSV 缺少交易时间")
             warnings = []
             if "symbol" not in mapping.values():
                 warnings.append("CSV 无证券代码，将从文件名提取")
             return ArchiveProfile(
-                encoding=encoding, delimiter=delimiter,
-                members=[m.filename for m in members], columns=mapping,
+                encoding=encoding,
+                delimiter=delimiter,
+                members=[m.filename for m in members],
+                columns=mapping,
                 sample_rows=max(0, len(sample.splitlines()) - 1),
                 timestamp_convention=self.config.minute.timestamp_convention,
                 warnings=warnings,
@@ -147,7 +147,9 @@ class MinuteArchiveImporter:
             exchange = "SH" if code.startswith(("5", "6", "9")) else "SZ"
         return f"{code}.{exchange.upper()}"
 
-    def _normalize_chunk(self, chunk: pd.DataFrame, member: str, profile: ArchiveProfile, file_hash: str) -> pd.DataFrame:
+    def _normalize_chunk(
+        self, chunk: pd.DataFrame, member: str, profile: ArchiveProfile, file_hash: str
+    ) -> pd.DataFrame:
         out = chunk.rename(columns=profile.columns).copy()
         if "symbol" not in out:
             out["symbol"] = self._symbol_from_name(member)
@@ -172,9 +174,21 @@ class MinuteArchiveImporter:
             out[col] = pd.to_numeric(out[col], errors="coerce")
         out["source"] = "tushare_zip"
         out["source_file_hash"] = file_hash
-        return out[["symbol", "trade_date", "bar_time", "open", "high", "low", "close", "volume", "amount", "source", "source_file_hash"]].dropna(
-            subset=["symbol", "bar_time", "open", "high", "low", "close", "volume"]
-        )
+        return out[
+            [
+                "symbol",
+                "trade_date",
+                "bar_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "source",
+                "source_file_hash",
+            ]
+        ].dropna(subset=["symbol", "bar_time", "open", "high", "low", "close", "volume"])
 
     @staticmethod
     def _normalize_symbol(value: str) -> str:
@@ -186,7 +200,9 @@ class MinuteArchiveImporter:
             return f"{code}.{exchange}"
         return f"{value}.{'SH' if value.startswith(('5', '6', '9')) else 'SZ'}"
 
-    def import_archive(self, path: str | Path, profile: ArchiveProfile | None = None) -> ImportResult:
+    def import_archive(
+        self, path: str | Path, profile: ArchiveProfile | None = None
+    ) -> ImportResult:
         path = Path(path)
         file_hash = self.hash_file(path)
         if self.store.minute_imported(file_hash):
@@ -202,8 +218,11 @@ class MinuteArchiveImporter:
                     with archive.open(members[name]) as raw:
                         text = io.TextIOWrapper(raw, encoding=profile.encoding, newline="")
                         for chunk in pd.read_csv(
-                            text, sep=profile.delimiter, chunksize=200_000,
-                            low_memory=False, dtype=str,
+                            text,
+                            sep=profile.delimiter,
+                            chunksize=200_000,
+                            low_memory=False,
+                            dtype=str,
                         ):
                             normalized = self._normalize_chunk(chunk, name, profile, file_hash)
                             if not normalized.empty:
@@ -212,8 +231,12 @@ class MinuteArchiveImporter:
                                 result.rows += len(normalized)
                                 chunk_min = normalized["bar_time"].min()
                                 chunk_max = normalized["bar_time"].max()
-                                min_time = chunk_min if min_time is None else min(min_time, chunk_min)
-                                max_time = chunk_max if max_time is None else max(max_time, chunk_max)
+                                min_time = (
+                                    chunk_min if min_time is None else min(min_time, chunk_min)
+                                )
+                                max_time = (
+                                    chunk_max if max_time is None else max(max_time, chunk_max)
+                                )
             if result.rows == 0:
                 raise DataQualityError("ZIP 中没有可导入的分钟记录")
             result.status = "success"
@@ -228,11 +251,17 @@ class MinuteArchiveImporter:
             if destination.exists():
                 destination = destination.with_name(f"{file_hash[:8]}_{destination.name}")
             shutil.move(str(path), destination)
-        self.store.record_minute_import({
-            "file_hash": file_hash, "file_name": path.name, "rows": result.rows,
-            "min_time": result.min_time, "max_time": result.max_time,
-            "status": result.status, "details": {"warnings": result.warnings, "profile": asdict(profile)},
-        })
+        self.store.record_minute_import(
+            {
+                "file_hash": file_hash,
+                "file_name": path.name,
+                "rows": result.rows,
+                "min_time": result.min_time,
+                "max_time": result.max_time,
+                "status": result.status,
+                "details": {"warnings": result.warnings, "profile": asdict(profile)},
+            }
+        )
         if result.status == "failed":
             raise DataQualityError("; ".join(result.warnings))
         return result
@@ -248,7 +277,9 @@ class MinuteArchiveImporter:
 
     def write_profile(self, path: str | Path, profile: ArchiveProfile) -> Path:
         target = Path(path)
-        target.write_text(json.dumps(asdict(profile), ensure_ascii=False, indent=2), encoding="utf-8")
+        target.write_text(
+            json.dumps(asdict(profile), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return target
 
 
@@ -268,16 +299,29 @@ def resample_minutes(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
     for (symbol, trade_date, session), part in work.groupby(["symbol", "trade_date", "session"]):
         part = part.sort_values("bar_time").copy()
         day = pd.Timestamp(trade_date).normalize()
-        session_open = day + pd.Timedelta(hours=9, minutes=30) if session == "am" else day + pd.Timedelta(hours=13)
+        session_open = (
+            day + pd.Timedelta(hours=9, minutes=30)
+            if session == "am"
+            else day + pd.Timedelta(hours=13)
+        )
         elapsed = (part["bar_time"] - session_open).dt.total_seconds().div(60)
         # A source may contain a 13:00 reopening bar; fold it into the first
         # regular afternoon target bar rather than emitting a zero-length bin.
         bucket = ((elapsed.clip(lower=1) + value - 1) // value).astype(int) * value
         part["target_time"] = session_open + pd.to_timedelta(bucket, unit="m")
-        agg = part.groupby("target_time", sort=True).agg(
-            open=("open", "first"), high=("high", "max"), low=("low", "min"),
-            close=("close", "last"), volume=("volume", "sum"), amount=("amount", "sum"),
-        ).dropna(subset=["open", "close"]).rename_axis("bar_time")
+        agg = (
+            part.groupby("target_time", sort=True)
+            .agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+                amount=("amount", "sum"),
+            )
+            .dropna(subset=["open", "close"])
+            .rename_axis("bar_time")
+        )
         agg["symbol"] = symbol
         agg["trade_date"] = trade_date
         agg["frequency"] = frequency
@@ -286,4 +330,10 @@ def resample_minutes(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
     if not auctions.empty:
         auctions["frequency"] = frequency
         rows.append(auctions)
-    return pd.concat(rows, ignore_index=True).sort_values(["symbol", "bar_time"]).reset_index(drop=True) if rows else pd.DataFrame()
+    return (
+        pd.concat(rows, ignore_index=True)
+        .sort_values(["symbol", "bar_time"])
+        .reset_index(drop=True)
+        if rows
+        else pd.DataFrame()
+    )

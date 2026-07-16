@@ -6,7 +6,12 @@ import pandas as pd
 import pytest
 
 from quant_trade.config import RetryConfig
-from quant_trade.data.base import DataProvider, EmptyDataError, PermanentProviderError
+from quant_trade.data.base import (
+    DataProvider,
+    EmptyDataError,
+    PermanentProviderError,
+    ProviderError,
+)
 from quant_trade.data.retry import retry_call
 from quant_trade.data.router import DataRouter
 from quant_trade.models import DataBatch, DataRequest, Dataset
@@ -66,11 +71,21 @@ class FakeProvider(DataProvider):
     def fetch(self, request):
         if self.fail:
             raise PermanentProviderError("permission denied")
-        data = pd.DataFrame({
-            "symbol": ["000001.SZ"], "trade_date": [pd.Timestamp("2024-01-02")],
-            "bar_time": [pd.NaT], "open": [10.0], "high": [11.0], "low": [9.0],
-            "close": [10.5], "volume": [100.0], "amount": [1000.0], "source": [self.name],
-        })
+        data = pd.DataFrame(
+            {
+                "symbol": ["000001.SZ"],
+                "trade_date": [pd.Timestamp("2024-01-02")],
+                "bar_time": [pd.NaT],
+                "open": [10.0],
+                "high": [11.0],
+                "low": [9.0],
+                "close": [10.5],
+                "volume": [100.0],
+                "amount": [1000.0],
+                "source": [self.name],
+                "adjustment": [str(request.adjustment)],
+            }
+        )
         return DataBatch(data, self.name, request)
 
 
@@ -85,34 +100,134 @@ class EmptyProvider(DataProvider):
         raise EmptyDataError("返回空行情")
 
 
+class WrongAdjustmentProvider(FakeProvider):
+    def fetch(self, request):
+        batch = super().fetch(request)
+        batch.data["adjustment"] = "none"
+        return batch
+
+
+class UnadjustedOnlyProvider(FakeProvider):
+    def supports(self, request):
+        return str(request.adjustment) == "none" and super().supports(request)
+
+
 def test_router_falls_back_on_empty_without_tripping_circuit(app_config):
     app_config.providers.priority = ["first", "second"]
     app_config.providers.retry.circuit_failures = 1
-    router = DataRouter(app_config, {
-        "first": EmptyProvider("first"),
-        "second": FakeProvider("second", False),
-    })
-    batch = router.fetch(DataRequest(
-        dataset=Dataset.BARS, symbols=("000001.SZ",),
-        start=date(2024, 1, 1), end=date(2024, 1, 2),
-    ))
+    router = DataRouter(
+        app_config,
+        {
+            "first": EmptyProvider("first"),
+            "second": FakeProvider("second", False),
+        },
+    )
+    batch = router.fetch(
+        DataRequest(
+            dataset=Dataset.BARS,
+            symbols=("000001.SZ",),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 2),
+        )
+    )
     assert batch.provider == "second"
     # A single failure trips the breaker at threshold 1, so "first" staying
     # available proves the empty result was not counted as a failure.
     assert router.circuit.allow("first")
 
 
+def test_router_reports_all_empty_as_empty_data(app_config):
+    app_config.providers.priority = ["first"]
+    router = DataRouter(app_config, {"first": EmptyProvider("first")})
+    with pytest.raises(EmptyDataError, match="均返回空结果"):
+        router.fetch(
+            DataRequest(
+                dataset=Dataset.BARS,
+                symbols=("000001.SZ",),
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 2),
+            )
+        )
+    assert router.circuit.allow("first")
+
+
 def test_router_records_explicit_fallback(app_config):
     app_config.providers.priority = ["first", "second"]
     app_config.providers.retry.delays = [0] * 6
-    router = DataRouter(app_config, {
-        "first": FakeProvider("first", True),
-        "second": FakeProvider("second", False),
-    })
-    batch = router.fetch(DataRequest(
-        dataset=Dataset.BARS, symbols=("000001.SZ",),
-        start=date(2024, 1, 1), end=date(2024, 1, 2),
-    ))
+    router = DataRouter(
+        app_config,
+        {
+            "first": FakeProvider("first", True),
+            "second": FakeProvider("second", False),
+        },
+    )
+    batch = router.fetch(
+        DataRequest(
+            dataset=Dataset.BARS,
+            symbols=("000001.SZ",),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 2),
+        )
+    )
     assert batch.provider == "second"
     assert any("回退" in warning for warning in batch.warnings)
 
+
+def test_router_rejects_mislabeled_adjustment(app_config):
+    app_config.providers.priority = ["wrong"]
+    app_config.providers.retry.attempts = 1
+    router = DataRouter(app_config, {"wrong": WrongAdjustmentProvider("wrong", False)})
+    with pytest.raises(ProviderError, match="返回复权方式"):
+        router.fetch(
+            DataRequest(
+                dataset=Dataset.BARS,
+                symbols=("000001.SZ",),
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 2),
+                adjustment="hfq",
+            )
+        )
+
+
+def test_router_falls_back_for_adjusted_request(app_config):
+    app_config.providers.priority = ["raw", "adjusted"]
+    router = DataRouter(
+        app_config,
+        {
+            "raw": UnadjustedOnlyProvider("raw", False),
+            "adjusted": FakeProvider("adjusted", False),
+        },
+    )
+    batch = router.fetch(
+        DataRequest(
+            dataset=Dataset.BARS,
+            symbols=("510300.SH",),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 2),
+            adjustment="hfq",
+        )
+    )
+    assert batch.provider == "adjusted"
+    assert any("raw: 不支持" in warning for warning in batch.warnings)
+
+
+def test_circuit_open_plus_empty_is_not_confirmed_empty(app_config):
+    app_config.providers.priority = ["broken", "empty"]
+    app_config.providers.retry.circuit_failures = 1
+    router = DataRouter(
+        app_config,
+        {
+            "broken": FakeProvider("broken", False),
+            "empty": EmptyProvider("empty"),
+        },
+    )
+    router.circuit.failure("broken")
+    with pytest.raises(ProviderError, match="所有数据源均失败"):
+        router.fetch(
+            DataRequest(
+                dataset=Dataset.BARS,
+                symbols=("000001.SZ",),
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 2),
+            )
+        )

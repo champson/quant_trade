@@ -22,4 +22,3 @@ def app_config(tmp_path: Path) -> AppConfig:
             quarantine=tmp_path / "data" / "quarantine" / "minute",
         ),
     )
-

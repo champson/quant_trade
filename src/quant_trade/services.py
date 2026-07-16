@@ -1,35 +1,35 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 
 from quant_trade.backtest import ExecutionConfig, run_weight_backtest, save_backtest_report
 from quant_trade.config import AppConfig
+from quant_trade.data.calendar import trading_days
+from quant_trade.data.base import EmptyDataError
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
-from quant_trade.models import AssetType, DataRequest, Dataset, Frequency
+from quant_trade.models import Adjustment, AssetType, DataRequest, Dataset, Frequency
 from quant_trade.strategies import get_strategy
 
 
-# A cache only covers the request when its first row is within the longest
-# A-share holiday span of the requested start and the rows are dense enough to
-# be a real daily series rather than scattered snapshot dates.
-_HEAD_TOLERANCE_DAYS = 12
-_MIN_TRADING_DENSITY = 0.6
-
-
-def _cached_range_state(cached: pd.DataFrame, start: date, end: date) -> tuple[bool, date]:
-    """Return (fully_covered, fetch_start) for a cached daily series."""
-    days = pd.to_datetime(cached["trade_date"]).dt.date
-    first, last = days.min(), days.max()
-    span = pd.bdate_range(first, last)
-    dense = len(span) == 0 or days.nunique() >= _MIN_TRADING_DENSITY * len(span)
-    if not dense or (first - start).days > _HEAD_TOLERANCE_DAYS:
-        return False, start
-    if last >= end:
-        return True, start
-    return False, max(start, last + timedelta(days=1))
+def _missing_ranges(
+    expected: list[date], covered: set[date]
+) -> list[tuple[date, date, list[date]]]:
+    missing_positions = [index for index, day in enumerate(expected) if day not in covered]
+    if not missing_positions:
+        return []
+    groups: list[list[int]] = [[missing_positions[0]]]
+    for position in missing_positions[1:]:
+        if position == groups[-1][-1] + 1:
+            groups[-1].append(position)
+        else:
+            groups.append([position])
+    return [
+        (expected[group[0]], expected[group[-1]], [expected[index] for index in group])
+        for group in groups
+    ]
 
 
 def update_bars(
@@ -44,36 +44,75 @@ def update_bars(
     adjustment: str = "none",
     resume: bool = True,
 ) -> pd.DataFrame:
+    mode = Adjustment(adjustment)
     groups = [[symbol] for symbol in symbols] if symbols else [[]]
     frames: list[pd.DataFrame] = []
+    expected = trading_days(router, start, end, store) if symbols else []
     for group in groups:
-        fetch_start = start
-        if resume and not group and start == end and store.market_snapshot_complete(asset_type.value, end):
+        if (
+            resume
+            and not group
+            and start == end
+            and store.market_snapshot_complete(asset_type, end, mode)
+        ):
             continue
-        if resume and group:
-            cached = store.read_daily(group, str(start), str(end), adjustment=adjustment)
-            if not cached.empty:
-                covered, fetch_start = _cached_range_state(cached, start, end)
-                if covered:
-                    continue
-        batch = router.fetch(DataRequest(
-            dataset=Dataset.BARS, symbols=tuple(group), start=fetch_start, end=end,
-            frequency=Frequency.DAY, asset_type=asset_type, provider=provider,
-            adjustment=adjustment,
-        ))
-        store.write_daily(batch.data, asset_type.value)
-        if not group and start == end:
-            store.mark_market_snapshot(asset_type.value, end)
-        frames.append(batch.data)
+        if not group:
+            ranges = [(start, end, [start])]
+        else:
+            cached = store.read_daily(
+                group, str(start), str(end), asset_type=asset_type, adjustment=mode
+            )
+            actual = (
+                set(pd.to_datetime(cached["trade_date"]).dt.date) if not cached.empty else set()
+            )
+            covered = actual | store.confirmed_empty_daily_dates(
+                asset_type, mode, group[0], start, end
+            )
+            ranges = _missing_ranges(expected, covered if resume else set())
+        for fetch_start, fetch_end, covered_days in ranges:
+            # Today's bar may not be published yet when fetching intraday;
+            # keep it uncovered so the next run fetches it again.
+            durable_days = [day for day in covered_days if day < date.today()]
+            try:
+                batch = router.fetch(
+                    DataRequest(
+                        dataset=Dataset.BARS,
+                        symbols=tuple(group),
+                        start=fetch_start,
+                        end=fetch_end,
+                        frequency=Frequency.DAY,
+                        asset_type=asset_type,
+                        provider=provider,
+                        adjustment=mode,
+                    )
+                )
+            except EmptyDataError:
+                if not group:
+                    raise
+                store.mark_daily_empty_dates(asset_type, mode, group[0], durable_days)
+                continue
+            if not batch.data.empty:
+                store.write_daily(batch.data, asset_type)
+            if not group and start == end:
+                store.mark_market_snapshot(asset_type, end, mode)
+            frames.append(batch.data)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def update_daily_basic(
-    router: DataRouter, store: DataStore, trade_date: date, provider: str = "auto",
+    router: DataRouter,
+    store: DataStore,
+    trade_date: date,
+    provider: str = "auto",
 ) -> pd.DataFrame:
-    batch = router.fetch(DataRequest(
-        dataset=Dataset.DAILY_BASIC, start=trade_date, end=trade_date, provider=provider,
-    ))
+    batch = router.fetch(
+        DataRequest(
+            dataset=Dataset.DAILY_BASIC,
+            start=trade_date,
+            end=trade_date,
+            provider=provider,
+        )
+    )
     store.write_daily_basic(batch.data)
     return batch.data
 
@@ -83,23 +122,10 @@ def strategy_bars(
     symbols: list[str],
     start: str | None,
     end: str | None,
+    asset_type: AssetType,
     adjustment: str = "none",
 ) -> pd.DataFrame:
-    if symbols:
-        data = store.read_daily(symbols, start, end, adjustment=adjustment)
-    else:
-        paths = list((store.root / "daily" / AssetType.STOCK.value).glob("*.parquet"))
-        data = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True) if paths else pd.DataFrame()
-        if not data.empty:
-            if "adjustment" in data:
-                data = data[data["adjustment"].fillna("none") == adjustment]
-            elif adjustment != "none":
-                data = data.iloc[0:0]
-            data["trade_date"] = pd.to_datetime(data["trade_date"])
-            if start:
-                data = data[data["trade_date"] >= pd.Timestamp(start)]
-            if end:
-                data = data[data["trade_date"] <= pd.Timestamp(end)]
+    data = store.read_daily(symbols, start, end, asset_type=asset_type, adjustment=adjustment)
     if data.empty:
         raise ValueError("本地没有策略所需行情，请先执行 qt data update")
     missing = sorted(set(symbols) - set(data["symbol"]))
@@ -111,10 +137,15 @@ def strategy_bars(
 def run_strategy_signal(config: AppConfig, store: DataStore, name: str, as_of: str | None = None):
     cfg = config.strategies.get(name, {})
     symbols = list(cfg.get("symbols", []))
-    bars = strategy_bars(store, symbols, None, as_of, str(cfg.get("adjustment", "none")))
+    asset_type = AssetType(cfg.get("asset_type", "stock" if name == "microcap" else "etf"))
+    bars = strategy_bars(
+        store, symbols, None, as_of, asset_type, str(cfg.get("adjustment", "none"))
+    )
     if name == "microcap":
         basic = store.read_daily_basic(None, as_of)
-        bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
+        bars = bars.merge(
+            basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner"
+        )
     strategy = get_strategy(name, cfg)
     result = strategy.latest_signal(bars)
     out_dir = config.paths.artifacts_dir / "signals" / name
@@ -133,16 +164,21 @@ def run_strategy_backtest(
     cfg = config.strategies.get(name, {})
     symbols = list(cfg.get("symbols", []))
     adjustment = str(cfg.get("adjustment", "none"))
-    bars = strategy_bars(store, symbols, start, end, adjustment)
+    asset_type = AssetType(cfg.get("asset_type", "stock" if name == "microcap" else "etf"))
+    bars = strategy_bars(store, symbols, start, end, asset_type, adjustment)
     if name == "microcap":
         basic = store.read_daily_basic(start, end)
-        bars = bars.merge(basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner")
+        bars = bars.merge(
+            basic[["symbol", "trade_date", "total_mv"]], on=["symbol", "trade_date"], how="inner"
+        )
     strategy = get_strategy(name, cfg)
     targets = strategy.generate_targets(bars)
     bc = config.backtest
     execution = ExecutionConfig(
-        initial_cash=bc.initial_cash, commission_rate=bc.commission_rate,
-        stamp_duty_rate=bc.stamp_duty_rate, slippage_rate=bc.slippage_rate,
+        initial_cash=bc.initial_cash,
+        commission_rate=bc.commission_rate,
+        stamp_duty_rate=bc.stamp_duty_rate,
+        slippage_rate=bc.slippage_rate,
         risk_free_annual=bc.risk_free_annual,
     )
     result = run_weight_backtest(bars, targets, execution)
@@ -150,7 +186,20 @@ def run_strategy_backtest(
     benchmark_name = cfg.get("benchmark")
     benchmark_equity = None
     if benchmark_name:
-        benchmark_bars = store.read_daily([benchmark_name], start, end, adjustment=adjustment)
+        benchmark_asset_type = AssetType(cfg.get("benchmark_asset_type", asset_type.value))
+        benchmark_adjustment = Adjustment(
+            cfg.get(
+                "benchmark_adjustment",
+                "none" if benchmark_asset_type == AssetType.INDEX else adjustment,
+            )
+        )
+        benchmark_bars = store.read_daily(
+            [benchmark_name],
+            start,
+            end,
+            asset_type=benchmark_asset_type,
+            adjustment=benchmark_adjustment,
+        )
         if not benchmark_bars.empty:
             closes = benchmark_bars.sort_values("trade_date").set_index("trade_date")["close"]
             benchmark_equity = closes / closes.iloc[0] * execution.initial_cash

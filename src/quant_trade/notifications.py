@@ -11,6 +11,6 @@ def notify(title: str, message: str) -> None:
     safe_message = message.replace('"', "'")
     subprocess.run(
         ["osascript", "-e", f'display notification "{safe_message}" with title "{safe_title}"'],
-        check=False, capture_output=True,
+        check=False,
+        capture_output=True,
     )
-

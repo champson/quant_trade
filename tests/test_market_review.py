@@ -17,3 +17,5 @@ def test_market_review_counts_all_symbols():
     assert report.summary["up"] == 1
     assert report.summary["down"] == 1
     assert report.breadth["当天"].sum() == 3
+    flat = report.breadth.set_index("区间").loc["平盘", "当天"]
+    assert flat == 1

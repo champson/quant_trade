@@ -35,9 +35,11 @@ class LogBiasStrategy(Strategy):
         prices = bars.pivot(index="trade_date", columns="symbol", values="close").sort_index()
         bias = self._indicator(prices)
         result = super().latest_signal(bars)
-        result.diagnostics = pd.DataFrame({
-            "close": prices.loc[result.as_of], "logbias": bias.loc[result.as_of],
-            "target_weight": result.target_weights,
-        }).sort_values("logbias", ascending=False)
+        result.diagnostics = pd.DataFrame(
+            {
+                "close": prices.loc[result.as_of],
+                "logbias": bias.loc[result.as_of],
+                "target_weight": result.target_weights,
+            }
+        ).sort_values("logbias", ascending=False)
         return result
-

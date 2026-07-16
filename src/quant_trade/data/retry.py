@@ -101,7 +101,9 @@ def retry_call(
             # budget before the router can fall back.
             raise
         except Exception as raw:
-            exc = raw if isinstance(raw, TransientProviderError) else classify_provider_exception(raw)
+            exc = (
+                raw if isinstance(raw, TransientProviderError) else classify_provider_exception(raw)
+            )
             if isinstance(exc, PermanentProviderError):
                 raise exc from raw
             last = exc
@@ -114,4 +116,3 @@ def retry_call(
             sleep(delay)
     assert last is not None
     raise last
-

@@ -40,6 +40,7 @@ class Strategy(ABC):
         as_of = pd.Timestamp(targets.index[-1])
         weights = targets.iloc[-1]
         selected = weights[weights > 0]
-        summary = "空仓" if selected.empty else "、".join(f"{k} {v:.1%}" for k, v in selected.items())
+        summary = (
+            "空仓" if selected.empty else "、".join(f"{k} {v:.1%}" for k, v in selected.items())
+        )
         return SignalResult(as_of, weights, pd.DataFrame(), summary)
-

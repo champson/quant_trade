@@ -4,9 +4,14 @@ import time
 
 import pandas as pd
 
-from quant_trade.data.base import DataProvider, EmptyDataError, PermanentProviderError, ProviderError
+from quant_trade.data.base import (
+    DataProvider,
+    EmptyDataError,
+    PermanentProviderError,
+    ProviderError,
+)
 from quant_trade.data.providers.common import normalize_daily
-from quant_trade.models import AssetType, DataBatch, DataRequest, Dataset, Frequency
+from quant_trade.models import Adjustment, AssetType, DataBatch, DataRequest, Dataset, Frequency
 
 
 class BaoStockProvider(DataProvider):
@@ -25,6 +30,9 @@ class BaoStockProvider(DataProvider):
             super().supports(request)
             and request.frequency == Frequency.DAY
             and request.asset_type in {AssetType.STOCK, AssetType.INDEX}
+            and not (
+                request.asset_type == AssetType.INDEX and request.adjustment != Adjustment.NONE
+            )
         )
 
     @staticmethod
@@ -37,6 +45,7 @@ class BaoStockProvider(DataProvider):
     def _api(self):
         if self._bs is None:
             import baostock as bs
+
             self._bs = bs
         if not self._logged_in:
             result = self._bs.login()
@@ -60,13 +69,17 @@ class BaoStockProvider(DataProvider):
             return DataBatch(pd.DataFrame(rows, columns=rs.fields), self.name, request)
         frames = []
         fields = "date,code,open,high,low,close,volume,amount,adjustflag"
-        adjustflag = {"none": "3", "qfq": "2", "hfq": "1"}.get(request.adjustment, "3")
+        adjustflag = {Adjustment.NONE: "3", Adjustment.QFQ: "2", Adjustment.HFQ: "1"}[
+            request.adjustment
+        ]
         for symbol in request.symbols:
             rs = bs.query_history_k_data_plus(
-                self._code(symbol), fields,
+                self._code(symbol),
+                fields,
                 start_date=pd.Timestamp(request.start).strftime("%Y-%m-%d"),
                 end_date=pd.Timestamp(request.end).strftime("%Y-%m-%d"),
-                frequency="d", adjustflag=adjustflag,
+                frequency="d",
+                adjustflag=adjustflag,
             )
             if rs.error_code != "0":
                 raise ProviderError(rs.error_msg)
@@ -74,19 +87,33 @@ class BaoStockProvider(DataProvider):
             while rs.next():
                 rows.append(rs.get_row_data())
             raw = pd.DataFrame(rows, columns=rs.fields)
-            frames.append(normalize_daily(
-                raw, symbol=symbol, provider=self.name,
-                columns={"date": "trade_date", "code": "provider_code"},
-                adjustment=request.adjustment,
-            ))
+            if not raw.empty:
+                echoed = set(raw["adjustflag"].dropna().astype(str).str.strip())
+                if echoed != {adjustflag}:
+                    raise PermanentProviderError(
+                        f"BaoStock 复权回显 {sorted(echoed)} 与请求 {adjustflag} 不一致"
+                    )
+            frames.append(
+                normalize_daily(
+                    raw,
+                    symbol=symbol,
+                    provider=self.name,
+                    columns={"date": "trade_date", "code": "provider_code"},
+                    adjustment=request.adjustment,
+                )
+            )
             time.sleep(self.interval_seconds)
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if data.empty:
             raise EmptyDataError("BaoStock 返回空行情")
-        return DataBatch(data.sort_values(["trade_date", "symbol"]), self.name, request)
+        return DataBatch(
+            data.sort_values(["trade_date", "symbol"]),
+            self.name,
+            request,
+            metadata={"adjustment_evidence": "response_echo"},
+        )
 
     def close(self) -> None:
         if self._bs is not None and self._logged_in:
             self._bs.logout()
             self._logged_in = False
-

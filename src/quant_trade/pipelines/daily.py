@@ -7,10 +7,11 @@ from pathlib import Path
 import pandas as pd
 
 from quant_trade.config import AppConfig
+from quant_trade.data.calendar import trading_days
 from quant_trade.data.minute_archive import MinuteArchiveImporter
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
-from quant_trade.models import AssetType, DataRequest, Dataset
+from quant_trade.models import Adjustment, AssetType
 from quant_trade.notifications import notify
 from quant_trade.reports.market_review import (
     asset_return_summary,
@@ -33,18 +34,31 @@ class DailyResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def trading_days(router: DataRouter, start: date, end: date) -> list[date]:
-    batch = router.fetch(DataRequest(dataset=Dataset.TRADE_CALENDAR, start=start, end=end))
-    df = batch.data.copy()
-    if "cal_date" in df:
-        mask = pd.to_numeric(df.get("is_open", 0), errors="coerce").fillna(0).astype(int) == 1
-        values = df.loc[mask, "cal_date"]
-    elif "calendar_date" in df:
-        mask = df.get("is_trading_day", "0").astype(str) == "1"
-        values = df.loc[mask, "calendar_date"]
-    else:
-        raise ValueError("交易日历字段无法识别")
-    return sorted(pd.to_datetime(values).dt.date.tolist())
+def _strategy_download_groups(
+    strategies: dict,
+) -> dict[tuple[AssetType, Adjustment], set[str]]:
+    """Group strategy and benchmark symbols by their actual storage contract."""
+    groups: dict[tuple[AssetType, Adjustment], set[str]] = {}
+    for name, strategy in strategies.items():
+        if not strategy.get("enabled"):
+            continue
+        asset = AssetType(strategy.get("asset_type", "stock" if name == "microcap" else "etf"))
+        adjustment = Adjustment(strategy.get("adjustment", "none"))
+        symbols = set(strategy.get("symbols", []))
+        if symbols:
+            groups.setdefault((asset, adjustment), set()).update(symbols)
+
+        benchmark = strategy.get("benchmark")
+        if benchmark:
+            benchmark_asset = AssetType(strategy.get("benchmark_asset_type", asset.value))
+            benchmark_adjustment = Adjustment(
+                strategy.get(
+                    "benchmark_adjustment",
+                    "none" if benchmark_asset == AssetType.INDEX else adjustment.value,
+                )
+            )
+            groups.setdefault((benchmark_asset, benchmark_adjustment), set()).add(str(benchmark))
+    return groups
 
 
 def _anchors(days: list[date], as_of: date) -> list[date]:
@@ -70,14 +84,16 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
     tracker = RunTracker(config, store, "daily", str(as_of))
     result = DailyResult(as_of)
     try:
-        calendar = trading_days(router, date(as_of.year - 1, 12, 1), as_of)
+        calendar = trading_days(router, date(as_of.year - 1, 12, 1), as_of, store)
         snapshot_dates = _anchors(calendar, as_of)
         for snapshot in snapshot_dates:
             update_bars(config, router, store, [], snapshot, snapshot, AssetType.STOCK)
             if config.strategies.get("microcap", {}).get("enabled"):
                 update_daily_basic(router, store, snapshot)
             try:
-                update_bars(config, router, store, [], snapshot, snapshot, AssetType.CONVERTIBLE_BOND)
+                update_bars(
+                    config, router, store, [], snapshot, snapshot, AssetType.CONVERTIBLE_BOND
+                )
             except Exception as exc:
                 result.warnings.append(f"可转债快照失败 {snapshot}: {exc}")
 
@@ -91,35 +107,48 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
         all_indices = list(dict.fromkeys(index_codes + bias_codes))
         if all_indices:
             update_bars(
-                config, router, store, all_indices,
-                min(snapshot_dates) - timedelta(days=80), as_of, AssetType.INDEX,
+                config,
+                router,
+                store,
+                all_indices,
+                min(snapshot_dates) - timedelta(days=80),
+                as_of,
+                AssetType.INDEX,
             )
 
         strategy_start = as_of - timedelta(days=420)
-        etf_symbols_by_adjustment: dict[str, set[str]] = {}
-        for name, cfg in config.strategies.items():
-            if cfg.get("enabled") and name != "microcap":
-                group = etf_symbols_by_adjustment.setdefault(str(cfg.get("adjustment", "none")), set())
-                group.update(cfg.get("symbols", []))
-                if cfg.get("benchmark"):
-                    group.add(str(cfg["benchmark"]))
-        for adjustment, symbols in etf_symbols_by_adjustment.items():
-            if symbols:
-                update_bars(
-                    config, router, store, sorted(symbols), strategy_start, as_of,
-                    AssetType.ETF, adjustment=adjustment,
-                )
+        for (asset_type, adjustment), symbols in _strategy_download_groups(
+            config.strategies
+        ).items():
+            update_bars(
+                config,
+                router,
+                store,
+                sorted(symbols),
+                strategy_start,
+                as_of,
+                asset_type,
+                adjustment=adjustment.value,
+            )
 
         imported = MinuteArchiveImporter(config, store).import_inbox()
         result.minute_imports = [r.__dict__ for r in imported]
 
-        market = store.read_daily([], None, str(as_of))
-        # read_daily([]) intentionally returns empty; enumerate stored stock snapshots.
-        stock_paths = list((store.root / "daily" / AssetType.STOCK.value).glob("*.parquet"))
-        if stock_paths:
-            market = pd.concat([pd.read_parquet(path) for path in stock_paths], ignore_index=True)
+        market = store.read_daily(
+            [], None, str(as_of), asset_type=AssetType.STOCK, adjustment="none"
+        )
         review = build_market_review(market, as_of)
-        index_bars = store.read_daily(index_codes, None, str(as_of)) if index_codes else pd.DataFrame()
+        index_bars = (
+            store.read_daily(
+                index_codes,
+                None,
+                str(as_of),
+                asset_type=AssetType.INDEX,
+                adjustment="none",
+            )
+            if index_codes
+            else pd.DataFrame()
+        )
         index_ret = period_returns(index_bars, as_of) if not index_bars.empty else None
         if index_ret is not None:
             name_by_code = {v: k for k, v in (config.review.get("indices") or {}).items()}
@@ -128,20 +157,34 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
         portfolio_file = config.review.get("portfolio_file")
         if portfolio_file and Path(portfolio_file).exists():
             portfolio = portfolio_returns(market, pd.read_csv(portfolio_file, dtype=str), as_of)
-        cb_paths = list((store.root / "daily" / AssetType.CONVERTIBLE_BOND.value).glob("*.parquet"))
+        cb_bars = store.read_daily(
+            [],
+            None,
+            str(as_of),
+            asset_type=AssetType.CONVERTIBLE_BOND,
+            adjustment="none",
+        )
         cb_summary = None
-        if cb_paths:
-            cb_bars = pd.concat([pd.read_parquet(path) for path in cb_paths], ignore_index=True)
+        if not cb_bars.empty:
             cb_summary = asset_return_summary(cb_bars, as_of)
         bias = None
         if bias_codes:
-            bias_bars = store.read_daily(bias_codes, None, str(as_of))
+            bias_bars = store.read_daily(
+                bias_codes,
+                None,
+                str(as_of),
+                asset_type=AssetType.INDEX,
+                adjustment="none",
+            )
             if not bias_bars.empty:
                 bias = logbias_table(bias_bars, int(config.review.get("bias_ema_window", 20)))
         paths = save_market_review(
-            review, config.paths.artifacts_dir / "reviews",
-            index_returns=index_ret, portfolio=portfolio,
-            convertible_summary=cb_summary, bias=bias,
+            review,
+            config.paths.artifacts_dir / "reviews",
+            index_returns=index_ret,
+            portfolio=portfolio,
+            convertible_summary=cb_summary,
+            bias=bias,
         )
         result.report_paths = {k: str(v) for k, v in paths.items()}
 

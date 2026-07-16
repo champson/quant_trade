@@ -39,28 +39,45 @@ def test_minute_zip_is_profiled_imported_and_deduplicated(app_config):
 
 def test_resampling_does_not_bridge_lunch(app_config):
     times = pd.to_datetime(["2024-01-02 11:29", "2024-01-02 11:30", "2024-01-02 13:01"])
-    data = pd.DataFrame({
-        "symbol": ["000001.SZ"] * 3, "trade_date": ["2024-01-02"] * 3,
-        "bar_time": times, "open": [1, 2, 10], "high": [2, 3, 11],
-        "low": [1, 2, 10], "close": [2, 3, 11], "volume": [1, 1, 1], "amount": [1, 1, 1],
-    })
+    data = pd.DataFrame(
+        {
+            "symbol": ["000001.SZ"] * 3,
+            "trade_date": ["2024-01-02"] * 3,
+            "bar_time": times,
+            "open": [1, 2, 10],
+            "high": [2, 3, 11],
+            "low": [1, 2, 10],
+            "close": [2, 3, 11],
+            "volume": [1, 1, 1],
+            "amount": [1, 1, 1],
+        }
+    )
     result = resample_minutes(data, "5min")
     assert len(result) == 2
     assert set(result["open"]) == {1, 10}
 
 
 def test_resampling_folds_1300_reopen_into_first_afternoon_bucket():
-    data = pd.DataFrame({
-        "symbol": ["510300.SH"] * 4,
-        "trade_date": ["2024-01-02"] * 4,
-        "bar_time": pd.to_datetime([
-            "2024-01-02 13:00", "2024-01-02 13:05",
-            "2024-01-02 13:10", "2024-01-02 13:15",
-        ]),
-        "open": [1, 2, 3, 4], "high": [2, 3, 4, 5],
-        "low": [1, 2, 3, 4], "close": [2, 3, 4, 5],
-        "volume": [1, 1, 1, 1], "amount": [1, 1, 1, 1],
-    })
+    data = pd.DataFrame(
+        {
+            "symbol": ["510300.SH"] * 4,
+            "trade_date": ["2024-01-02"] * 4,
+            "bar_time": pd.to_datetime(
+                [
+                    "2024-01-02 13:00",
+                    "2024-01-02 13:05",
+                    "2024-01-02 13:10",
+                    "2024-01-02 13:15",
+                ]
+            ),
+            "open": [1, 2, 3, 4],
+            "high": [2, 3, 4, 5],
+            "low": [1, 2, 3, 4],
+            "close": [2, 3, 4, 5],
+            "volume": [1, 1, 1, 1],
+            "amount": [1, 1, 1, 1],
+        }
+    )
     result = resample_minutes(data, "15min")
     assert len(result) == 1
     assert result.iloc[0]["bar_time"] == pd.Timestamp("2024-01-02 13:15")

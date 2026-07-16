@@ -26,10 +26,21 @@ def normalize_daily(
         out[name] = pd.to_numeric(out[name], errors="coerce")
     out["bar_time"] = pd.NaT
     out["source"] = provider
-    out["adjustment"] = adjustment
+    out["adjustment"] = str(adjustment)
     return out[
-        ["symbol", "trade_date", "bar_time", "open", "high", "low", "close",
-         "volume", "amount", "source", "adjustment"]
+        [
+            "symbol",
+            "trade_date",
+            "bar_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "source",
+            "adjustment",
+        ]
     ].dropna(subset=["trade_date", "open", "high", "low", "close"])
 
 
@@ -37,4 +48,3 @@ def ymd(value) -> str | None:
     if value is None:
         return None
     return pd.Timestamp(value).strftime("%Y%m%d")
-

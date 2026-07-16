@@ -37,12 +37,19 @@ class DataRouter:
 
     def fetch(self, request: DataRequest) -> DataBatch:
         errors: list[str] = []
+        saw_empty = False
+        saw_provider_failure = False
         for name in self._candidates(request):
             provider = self.providers.get(name)
-            if provider is None or not provider.supports(request):
+            if provider is None:
+                saw_provider_failure = True
+                errors.append(f"{name}: 未配置")
+                continue
+            if not provider.supports(request):
                 errors.append(f"{name}: 不支持该数据集")
                 continue
             if not self.circuit.allow(name):
+                saw_provider_failure = True
                 errors.append(f"{name}: 熔断中")
                 continue
             try:
@@ -52,6 +59,16 @@ class DataRouter:
                 )
                 if request.dataset == Dataset.BARS:
                     batch.warnings.extend(validate_bars(batch.data))
+                    # This verifies the normalized storage contract only. Providers
+                    # must validate source-side evidence (BaoStock's adjustflag, for
+                    # example) before assigning this label.
+                    if "adjustment" not in batch.data:
+                        raise ValueError(f"{name} 行情缺少 adjustment 字段")
+                    actual = set(batch.data["adjustment"].dropna().astype(str).unique())
+                    if actual != {str(request.adjustment)}:
+                        raise ValueError(
+                            f"{name} 返回复权方式 {sorted(actual)}，请求为 {request.adjustment}"
+                        )
                 self.circuit.success(name)
                 if errors:
                     batch.warnings.append("数据源回退: " + " | ".join(errors))
@@ -60,27 +77,41 @@ class DataRouter:
                         dataset=request.dataset.value,
                         provider=name,
                         symbols=",".join(request.symbols),
-                        adjustment=request.adjustment,
-                        start=str(request.start), end=str(request.end), rows=len(batch.data),
-                        status="success", warnings=batch.warnings,
+                        adjustment=str(request.adjustment),
+                        start=str(request.start),
+                        end=str(request.end),
+                        rows=len(batch.data),
+                        status="success",
+                        warnings=batch.warnings,
                     )
                 return batch
             except PermanentProviderError as exc:
+                saw_provider_failure = True
                 errors.append(f"{name}: {exc}")
             except EmptyDataError as exc:
                 # No rows is not a provider fault; fall back without
                 # counting it against the circuit breaker.
+                saw_empty = True
                 errors.append(f"{name}: {exc}")
             except Exception as exc:
+                saw_provider_failure = True
                 self.circuit.failure(name)
                 errors.append(f"{name}: {exc}")
+        empty_result = saw_empty and not saw_provider_failure
         if self.store:
             self.store.record_fetch(
-                dataset=request.dataset.value, provider="none",
-                symbols=",".join(request.symbols), adjustment=request.adjustment,
-                start=str(request.start), end=str(request.end),
-                rows=0, status="failed", warnings=errors,
+                dataset=request.dataset.value,
+                provider="none",
+                symbols=",".join(request.symbols),
+                adjustment=str(request.adjustment),
+                start=str(request.start),
+                end=str(request.end),
+                rows=0,
+                status="empty" if empty_result else "failed",
+                warnings=errors,
             )
+        if empty_result:
+            raise EmptyDataError("所有可用数据源均返回空结果: " + " | ".join(errors))
         raise ProviderError("所有数据源均失败: " + " | ".join(errors))
 
     def close(self) -> None:
@@ -105,4 +136,3 @@ def build_router(config: AppConfig, store: DataStore | None = None) -> DataRoute
         ),
     }
     return DataRouter(config, providers, store)
-

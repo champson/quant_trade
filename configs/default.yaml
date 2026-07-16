@@ -41,15 +41,20 @@ backtest:
 strategies:
   etf_rotation:
     enabled: true
+    asset_type: etf
     adjustment: hfq
     symbols: [512800.SH, 515030.SH, 515790.SH, 513100.SH, 518880.SH]
     momentum_windows: [20, 60]
     ma_window: 28
     hold_num: 1
     rebalance_days: 5
+    rebalance_anchor: 2000-01-03
     benchmark: 510300.SH
+    benchmark_asset_type: etf
+    benchmark_adjustment: hfq
   logbias:
     enabled: true
+    asset_type: etf
     adjustment: hfq
     symbols: [512800.SH, 515030.SH, 515790.SH]
     ema_window: 20
@@ -58,6 +63,7 @@ strategies:
     stop: -5.0
   microcap:
     enabled: false
+    asset_type: stock
     pool_size: 400
     selection: pool
     hold_count: 400

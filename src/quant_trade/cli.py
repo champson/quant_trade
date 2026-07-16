@@ -16,9 +16,9 @@ from quant_trade.data.minute_archive import MinuteArchiveImporter
 from quant_trade.data.minute_directory import MinuteDirectoryImporter
 from quant_trade.data.router import build_router
 from quant_trade.data.storage import DataStore
-from quant_trade.models import AssetType
+from quant_trade.models import Adjustment, AssetType
+from quant_trade.data.calendar import trading_days
 from quant_trade.pipelines.daily import run_daily
-from quant_trade.pipelines.daily import trading_days
 from quant_trade.reports.market_review import build_market_review
 from quant_trade.reports.render import save_market_review
 from quant_trade.services import (
@@ -62,18 +62,35 @@ def data_update(
     end: Annotated[str | None, typer.Option()] = None,
     asset_type: Annotated[AssetType, typer.Option()] = AssetType.STOCK,
     provider: Annotated[str, typer.Option()] = "auto",
-    adjustment: Annotated[str, typer.Option()] = "none",
+    adjustment: Annotated[Adjustment, typer.Option()] = Adjustment.NONE,
     force: Annotated[bool, typer.Option("--force", help="忽略完整缓存并重新下载")] = False,
     config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
-    cfg, store, router = _runtime(config)
     end_date = _date(end, date.today())
     start_date = _date(start, end_date if not symbols else end_date - timedelta(days=420))
     codes = [x.strip() for x in symbols.split(",") if x.strip()]
+    if not codes and adjustment != Adjustment.NONE:
+        raise typer.BadParameter("全市场快照只支持 adjustment=none", param_hint="--adjustment")
+    if not codes and asset_type not in {
+        AssetType.STOCK,
+        AssetType.CONVERTIBLE_BOND,
+    }:
+        raise typer.BadParameter(
+            "全市场快照只支持 stock 或 convertible_bond", param_hint="--asset-type"
+        )
+    cfg, store, router = _runtime(config)
     try:
         frame = update_bars(
-            cfg, router, store, codes, start_date, end_date, asset_type,
-            provider, adjustment, resume=not force,
+            cfg,
+            router,
+            store,
+            codes,
+            start_date,
+            end_date,
+            asset_type,
+            provider,
+            adjustment,
+            resume=not force,
         )
         source = frame["source"].iloc[0] if not frame.empty else "本地缓存"
         typer.echo(f"完成：新增/更新 {len(frame):,} 行，来源 {source}")
@@ -93,11 +110,17 @@ def market_history(
     cfg, store, router = _runtime(config)
     start_date, end_date = pd.Timestamp(start).date(), _date(end, date.today())
     try:
-        days = trading_days(router, start_date, end_date)
+        days = trading_days(router, start_date, end_date, store)
         for index, trade_date in enumerate(days, 1):
             frame = update_bars(
-                cfg, router, store, [], trade_date, trade_date,
-                AssetType.STOCK, resume=not force,
+                cfg,
+                router,
+                store,
+                [],
+                trade_date,
+                trade_date,
+                AssetType.STOCK,
+                resume=not force,
             )
             if include_basic:
                 basic_path = store.daily_basic_path(str(trade_date))
@@ -109,14 +132,18 @@ def market_history(
 
 
 @minute_app.command("inspect")
-def minute_inspect(path: Path, config: Annotated[str | None, typer.Option("--config")] = None) -> None:
+def minute_inspect(
+    path: Path, config: Annotated[str | None, typer.Option("--config")] = None
+) -> None:
     cfg = load_config(config)
     profile = MinuteArchiveImporter(cfg, DataStore(cfg)).inspect(path)
     typer.echo(json.dumps(asdict(profile), ensure_ascii=False, indent=2))
 
 
 @minute_app.command("import")
-def minute_import(path: Path, config: Annotated[str | None, typer.Option("--config")] = None) -> None:
+def minute_import(
+    path: Path, config: Annotated[str | None, typer.Option("--config")] = None
+) -> None:
     cfg = load_config(config)
     result = MinuteArchiveImporter(cfg, DataStore(cfg)).import_archive(path)
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
@@ -202,10 +229,9 @@ def review_close(
 ) -> None:
     cfg = load_config(config)
     store = DataStore(cfg)
-    paths = list((store.root / "daily" / AssetType.STOCK.value).glob("*.parquet"))
-    if not paths:
+    bars = store.read_daily([], None, as_of, asset_type=AssetType.STOCK, adjustment="none")
+    if bars.empty:
         raise typer.BadParameter("没有股票行情，请先执行 qt data update")
-    bars = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
     report = build_market_review(bars, as_of)
     outputs = save_market_review(report, cfg.paths.artifacts_dir / "reviews")
     typer.echo(json.dumps({k: str(v) for k, v in outputs.items()}, ensure_ascii=False, indent=2))
@@ -239,7 +265,11 @@ def strategy_backtest(
     result = run_strategy_backtest(cfg, DataStore(cfg), name, start, end)
     typer.echo(json.dumps(result.metrics, ensure_ascii=False, indent=2))
     typer.echo("\n报告产物：")
-    typer.echo(json.dumps({key: str(path) for key, path in result.artifacts.items()}, ensure_ascii=False, indent=2))
+    typer.echo(
+        json.dumps(
+            {key: str(path) for key, path in result.artifacts.items()}, ensure_ascii=False, indent=2
+        )
+    )
 
 
 @research_app.command("correlation")
@@ -247,12 +277,14 @@ def research_correlation(
     symbols: Annotated[str, typer.Option(help="逗号分隔代码")],
     start: Annotated[str | None, typer.Option()] = None,
     end: Annotated[str | None, typer.Option()] = None,
+    asset_type: Annotated[AssetType, typer.Option()] = AssetType.STOCK,
+    adjustment: Annotated[Adjustment, typer.Option()] = Adjustment.NONE,
     config: Annotated[str | None, typer.Option("--config")] = None,
 ) -> None:
     cfg = load_config(config)
     store = DataStore(cfg)
     codes = [x.strip() for x in symbols.split(",") if x.strip()]
-    bars = store.read_daily(codes, start, end)
+    bars = store.read_daily(codes, start, end, asset_type=asset_type, adjustment=adjustment)
     prices = bars.pivot(index="trade_date", columns="symbol", values="close")
     corr = prices.pct_change(fill_method=None).corr()
     out = cfg.paths.artifacts_dir / "research" / "correlation.csv"
@@ -282,9 +314,14 @@ def dashboard(
 ) -> None:
     if config:
         import os
+
         os.environ["QT_CONFIG"] = config
     path = Path(__file__).parent / "dashboard" / "app.py"
-    raise typer.Exit(subprocess.run([sys.executable, "-m", "streamlit", "run", str(path), "--server.port", str(port)]).returncode)
+    raise typer.Exit(
+        subprocess.run(
+            [sys.executable, "-m", "streamlit", "run", str(path), "--server.port", str(port)]
+        ).returncode
+    )
 
 
 if __name__ == "__main__":

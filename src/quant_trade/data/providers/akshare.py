@@ -6,7 +6,7 @@ import pandas as pd
 
 from quant_trade.data.base import DataProvider, EmptyDataError, PermanentProviderError
 from quant_trade.data.providers.common import normalize_daily, ymd
-from quant_trade.models import AssetType, DataBatch, DataRequest, Dataset, Frequency
+from quant_trade.models import Adjustment, AssetType, DataBatch, DataRequest, Dataset, Frequency
 
 
 class AkShareProvider(DataProvider):
@@ -19,9 +19,14 @@ class AkShareProvider(DataProvider):
         return {Dataset.BARS}
 
     def supports(self, request: DataRequest) -> bool:
-        return super().supports(request) and request.frequency == Frequency.DAY and request.asset_type in {
-            AssetType.STOCK, AssetType.ETF, AssetType.INDEX
-        }
+        return (
+            super().supports(request)
+            and request.frequency == Frequency.DAY
+            and request.asset_type in {AssetType.STOCK, AssetType.ETF, AssetType.INDEX}
+            and not (
+                request.asset_type == AssetType.INDEX and request.adjustment != Adjustment.NONE
+            )
+        )
 
     def fetch(self, request: DataRequest) -> DataBatch:
         if not self.supports(request):
@@ -29,22 +34,59 @@ class AkShareProvider(DataProvider):
         import akshare as ak
 
         frames = []
-        adjust = "" if request.adjustment == "none" else request.adjustment
+        adjust = "" if request.adjustment == Adjustment.NONE else str(request.adjustment)
         for symbol in request.symbols:
             code = symbol.split(".")[0]
             if request.asset_type == AssetType.ETF:
-                raw = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=ymd(request.start), end_date=ymd(request.end), adjust=adjust)
+                raw = ak.fund_etf_hist_em(
+                    symbol=code,
+                    period="daily",
+                    start_date=ymd(request.start),
+                    end_date=ymd(request.end),
+                    adjust=adjust,
+                )
             elif request.asset_type == AssetType.INDEX:
-                raw = ak.index_zh_a_hist(symbol=code, period="daily", start_date=ymd(request.start), end_date=ymd(request.end))
+                raw = ak.index_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=ymd(request.start),
+                    end_date=ymd(request.end),
+                )
             else:
-                raw = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=ymd(request.start), end_date=ymd(request.end), adjust=adjust)
-            frames.append(normalize_daily(
-                raw, symbol=symbol, provider=self.name,
-                columns={"日期": "trade_date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount"},
-                adjustment=request.adjustment,
-            ))
+                raw = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=ymd(request.start),
+                    end_date=ymd(request.end),
+                    adjust=adjust,
+                )
+            frames.append(
+                normalize_daily(
+                    raw,
+                    symbol=symbol,
+                    provider=self.name,
+                    columns={
+                        "日期": "trade_date",
+                        "开盘": "open",
+                        "最高": "high",
+                        "最低": "low",
+                        "收盘": "close",
+                        "成交量": "volume",
+                        "成交额": "amount",
+                    },
+                    adjustment=request.adjustment,
+                )
+            )
             time.sleep(self.interval_seconds)
         data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if data.empty:
             raise EmptyDataError("AkShare 返回空行情")
-        return DataBatch(data.sort_values(["trade_date", "symbol"]), self.name, request)
+        batch = DataBatch(
+            data.sort_values(["trade_date", "symbol"]),
+            self.name,
+            request,
+            metadata={"adjustment_evidence": "request_parameter"},
+        )
+        if request.adjustment != Adjustment.NONE:
+            batch.warnings.append("AkShare 未回显实际复权方式；已按请求参数标记")
+        return batch
