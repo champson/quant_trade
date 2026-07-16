@@ -59,15 +59,18 @@ def run_weight_backtest(
 
     cash = float(config.initial_cash)
     shares = pd.Series(0.0, index=symbols)
+    # Positions keep their last observed price across missing bars (e.g. suspension)
+    # instead of being valued at zero.
+    marks = closes.fillna(opens).ffill()
+    previous_marks = marks.shift(1)
     equities: list[float] = []
     positions: list[pd.Series] = []
     trades: list[dict] = []
     dates = opens.index
     last_desired: pd.Series | None = None
 
-    for i, current in enumerate(dates):
+    for current in dates:
         open_px = opens.loc[current]
-        close_px = closes.loc[current]
         # A signal observed at the previous bar close can only trade now.
         previous_dates = targets.index[targets.index < current]
         desired = targets.loc[previous_dates[-1]] if len(previous_dates) else None
@@ -75,7 +78,7 @@ def run_weight_backtest(
             last_desired is None or not desired.equals(last_desired)
         )
         if changed:
-            mark_open = open_px.where(open_px.notna(), close_px)
+            mark_open = open_px.fillna(previous_marks.loc[current])
             portfolio_open = cash + float((shares * mark_open.fillna(0)).sum())
             current_value = shares * mark_open
             desired_value = desired * portfolio_open
@@ -115,9 +118,10 @@ def run_weight_backtest(
                     "notional": notional, "commission": commission, "tax": tax,
                 })
             last_desired = desired.copy()
-        equity = cash + float((shares * close_px.fillna(open_px).fillna(0)).sum())
+        mark_close = marks.loc[current].fillna(0)
+        equity = cash + float((shares * mark_close).sum())
         equities.append(equity)
-        value = shares * close_px.fillna(open_px).fillna(0)
+        value = shares * mark_close
         weights = value / equity if equity else value * 0
         weights.name = current
         positions.append(weights)

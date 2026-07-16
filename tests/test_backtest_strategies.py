@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from quant_trade.backtest.engine import ExecutionConfig, run_weight_backtest
 from quant_trade.strategies.etf_rotation import EtfRotationStrategy
@@ -45,6 +46,21 @@ def test_future_prices_do_not_change_past_trade():
     changed.loc[changed["trade_date"] == dates[-1], ["open", "close"]] = 999
     second = run_weight_backtest(changed, targets).trades.iloc[0]
     assert first[["date", "price", "quantity"]].equals(second[["date", "price", "quantity"]])
+
+
+def test_missing_bar_keeps_last_price_in_equity():
+    bars = _bars(("A", "B"), periods=4)
+    dates = sorted(bars["trade_date"].unique())
+    # A is suspended on day 3: no bar at all.
+    bars = bars[~((bars["symbol"] == "A") & (bars["trade_date"] == dates[2]))]
+    targets = pd.DataFrame({"A": [1.0]}, index=[dates[0]])
+    result = run_weight_backtest(
+        bars, targets,
+        ExecutionConfig(initial_cash=1000, commission_rate=0, stamp_duty_rate=0, slippage_rate=0),
+    )
+    # The position is valued at day 2's close during the suspension, not zero.
+    assert result.equity.loc[dates[2]] == pytest.approx(result.equity.loc[dates[1]])
+    assert result.equity.loc[dates[2]] > 0
 
 
 def test_etf_rotation_selects_top_candidate_instead_of_skipping_two():
