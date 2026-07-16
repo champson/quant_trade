@@ -37,6 +37,31 @@ class DataStore:
                     imported_at TIMESTAMP, rows BIGINT, min_time TIMESTAMP,
                     max_time TIMESTAMP, status VARCHAR, details VARCHAR
                 );
+                CREATE TABLE IF NOT EXISTS minute_sources (
+                    source_path VARCHAR, frequency VARCHAR, symbol VARCHAR,
+                    asset_type VARCHAR, file_hash VARCHAR, file_size BIGINT,
+                    file_mtime_ns BIGINT, imported_at TIMESTAMP,
+                    rows_input BIGINT, rows_written BIGINT, rows_filtered BIGINT,
+                    min_time TIMESTAMP, max_time TIMESTAMP,
+                    status VARCHAR, error VARCHAR,
+                    PRIMARY KEY (source_path, frequency)
+                );
+                CREATE TABLE IF NOT EXISTS minute_partitions (
+                    frequency VARCHAR, symbol VARCHAR, year INTEGER,
+                    asset_type VARCHAR, path VARCHAR, rows BIGINT,
+                    min_time TIMESTAMP, max_time TIMESTAMP,
+                    source_hash VARCHAR, updated_at TIMESTAMP,
+                    PRIMARY KEY (frequency, symbol, year)
+                );
+                CREATE TABLE IF NOT EXISTS minute_import_runs (
+                    run_id VARCHAR PRIMARY KEY, source_root VARCHAR,
+                    frequency VARCHAR, started_at TIMESTAMP,
+                    finished_at TIMESTAMP, status VARCHAR,
+                    files_total BIGINT, files_success BIGINT,
+                    files_skipped BIGINT, files_empty BIGINT,
+                    files_failed BIGINT, rows_written BIGINT,
+                    rows_filtered BIGINT, details VARCHAR
+                );
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id VARCHAR PRIMARY KEY, task VARCHAR, started_at TIMESTAMP,
                     finished_at TIMESTAMP, status VARCHAR, as_of VARCHAR,
@@ -127,7 +152,14 @@ class DataStore:
         return out.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
 
     def minute_partition(self, trade_date: str) -> Path:
+        """Legacy 1-minute layout kept for backward compatibility."""
         return self.root / "minute" / "1min" / f"trade_date={trade_date}" / "bars.parquet"
+
+    def minute_symbol_year_path(self, frequency: str, symbol: str, year: int) -> Path:
+        return (
+            self.root / "minute" / f"frequency={frequency}"
+            / f"symbol={self.safe_symbol(symbol)}" / f"year={year}.parquet"
+        )
 
     def write_minute(self, df: pd.DataFrame) -> int:
         written = 0
@@ -142,6 +174,162 @@ class DataStore:
             part.to_parquet(path, index=False)
             written += len(part)
         return written
+
+    def commit_minute_symbol(
+        self,
+        *,
+        frequency: str,
+        symbol: str,
+        asset_type: str,
+        staged: dict[int, Path],
+        statistics: dict[int, dict[str, Any]],
+        source_hash: str,
+    ) -> None:
+        """Atomically replace each symbol/year file, then update the catalog."""
+        target_dir = self.minute_symbol_year_path(frequency, symbol, 2000).parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        new_years = set(staged)
+        existing = set()
+        for path in target_dir.glob("year=*.parquet"):
+            try:
+                existing.add(int(path.stem.split("=", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        for year, staged_path in staged.items():
+            target = self.minute_symbol_year_path(frequency, symbol, year)
+            staged_path.replace(target)
+        for stale_year in existing - new_years:
+            self.minute_symbol_year_path(frequency, symbol, stale_year).unlink(missing_ok=True)
+
+        with self.connect() as con:
+            con.execute(
+                "DELETE FROM minute_partitions WHERE frequency = ? AND symbol = ?",
+                [frequency, symbol],
+            )
+            for year in sorted(new_years):
+                stat = statistics[year]
+                target = self.minute_symbol_year_path(frequency, symbol, year).resolve()
+                con.execute(
+                    "INSERT INTO minute_partitions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        frequency, symbol, year, asset_type, str(target), stat["rows"],
+                        stat["min_time"], stat["max_time"], source_hash, datetime.now(),
+                    ],
+                )
+
+    def read_minute(
+        self,
+        symbols: list[str],
+        start: str | datetime,
+        end: str | datetime,
+        frequency: str = "5min",
+        asset_types: list[str] | None = None,
+    ) -> pd.DataFrame:
+        if not symbols:
+            raise ValueError("分钟查询必须指定至少一个证券代码")
+        start_at, end_at = pd.Timestamp(start), pd.Timestamp(end)
+        placeholders = ",".join("?" for _ in symbols)
+        query = (
+            "SELECT path FROM minute_partitions "
+            f"WHERE frequency = ? AND symbol IN ({placeholders}) "
+            "AND max_time >= ? AND min_time <= ?"
+        )
+        params: list[Any] = [frequency, *symbols, start_at, end_at]
+        if asset_types:
+            query += f" AND asset_type IN ({','.join('?' for _ in asset_types)})"
+            params.extend(asset_types)
+        with self.connect() as con:
+            paths = [row[0] for row in con.execute(query, params).fetchall()]
+            if not paths:
+                return pd.DataFrame()
+            return con.execute(
+                """
+                SELECT * FROM read_parquet(?)
+                WHERE bar_time >= ? AND bar_time <= ?
+                ORDER BY symbol, bar_time
+                """,
+                [paths, start_at, end_at],
+            ).df()
+
+    def minute_source_unchanged(
+        self, source_path: str, frequency: str, file_hash: str
+    ) -> bool:
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT status, file_hash FROM minute_sources
+                WHERE source_path = ? AND frequency = ?
+                """,
+                [source_path, frequency],
+            ).fetchone()
+        return bool(row and row[0] in {"success", "empty"} and row[1] == file_hash)
+
+    def minute_source_stat_unchanged(
+        self,
+        source_path: str,
+        frequency: str,
+        file_size: int,
+        file_mtime_ns: int,
+    ) -> bool:
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT status, file_size, file_mtime_ns FROM minute_sources
+                WHERE source_path = ? AND frequency = ?
+                """,
+                [source_path, frequency],
+            ).fetchone()
+        return bool(
+            row and row[0] in {"success", "empty"}
+            and row[1] == file_size and row[2] == file_mtime_ns
+        )
+
+    def record_minute_source(self, values: dict[str, Any]) -> None:
+        with self.connect() as con:
+            con.execute(
+                "DELETE FROM minute_sources WHERE source_path = ? AND frequency = ?",
+                [values["source_path"], values["frequency"]],
+            )
+            con.execute(
+                "INSERT INTO minute_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    values["source_path"], values["frequency"], values.get("symbol"),
+                    values.get("asset_type"), values.get("file_hash"),
+                    values.get("file_size", 0), values.get("file_mtime_ns", 0),
+                    datetime.now(), values.get("rows_input", 0),
+                    values.get("rows_written", 0), values.get("rows_filtered", 0),
+                    values.get("min_time"), values.get("max_time"), values["status"],
+                    values.get("error"),
+                ],
+            )
+
+    def start_minute_import_run(
+        self, run_id: str, source_root: str, frequency: str, files_total: int
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO minute_import_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [run_id, source_root, frequency, datetime.now(), None, "running",
+                 files_total, 0, 0, 0, 0, 0, 0, "{}"],
+            )
+
+    def finish_minute_import_run(self, run_id: str, values: dict[str, Any]) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                UPDATE minute_import_runs SET finished_at = ?, status = ?,
+                  files_success = ?, files_skipped = ?, files_empty = ?,
+                  files_failed = ?, rows_written = ?, rows_filtered = ?, details = ?
+                WHERE run_id = ?
+                """,
+                [
+                    datetime.now(), values["status"], values.get("files_success", 0),
+                    values.get("files_skipped", 0), values.get("files_empty", 0),
+                    values.get("files_failed", 0), values.get("rows_written", 0),
+                    values.get("rows_filtered", 0),
+                    json.dumps(values.get("details", {}), ensure_ascii=False), run_id,
+                ],
+            )
 
     def minute_imported(self, file_hash: str) -> bool:
         with self.connect() as con:

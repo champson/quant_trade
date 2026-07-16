@@ -253,21 +253,37 @@ class MinuteArchiveImporter:
 
 
 def resample_minutes(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
-    """Aggregate 1-minute bars without crossing the A-share lunch break."""
+    """Aggregate minute bars by exchange session without crossing lunch."""
     if frequency not in {"5min", "15min", "30min", "60min"}:
         raise ValueError("只支持 5min/15min/30min/60min")
     value = int(frequency.removesuffix("min"))
     work = df.copy()
     work["bar_time"] = pd.to_datetime(work["bar_time"])
+    if "is_auction" not in work:
+        work["is_auction"] = False
+    auctions = work[work["is_auction"]].copy()
+    work = work[~work["is_auction"]].copy()
     work["session"] = work["bar_time"].dt.hour.lt(12).map({True: "am", False: "pm"})
     rows = []
     for (symbol, trade_date, session), part in work.groupby(["symbol", "trade_date", "session"]):
-        part = part.set_index("bar_time").sort_index()
-        agg = part.resample(f"{value}min", origin="start_day", label="right", closed="right").agg(
+        part = part.sort_values("bar_time").copy()
+        day = pd.Timestamp(trade_date).normalize()
+        session_open = day + pd.Timedelta(hours=9, minutes=30) if session == "am" else day + pd.Timedelta(hours=13)
+        elapsed = (part["bar_time"] - session_open).dt.total_seconds().div(60)
+        # A source may contain a 13:00 reopening bar; fold it into the first
+        # regular afternoon target bar rather than emitting a zero-length bin.
+        bucket = ((elapsed.clip(lower=1) + value - 1) // value).astype(int) * value
+        part["target_time"] = session_open + pd.to_timedelta(bucket, unit="m")
+        agg = part.groupby("target_time", sort=True).agg(
             open=("open", "first"), high=("high", "max"), low=("low", "min"),
             close=("close", "last"), volume=("volume", "sum"), amount=("amount", "sum"),
-        ).dropna(subset=["open", "close"])
+        ).dropna(subset=["open", "close"]).rename_axis("bar_time")
         agg["symbol"] = symbol
         agg["trade_date"] = trade_date
+        agg["frequency"] = frequency
+        agg["is_auction"] = False
         rows.append(agg.reset_index())
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not auctions.empty:
+        auctions["frequency"] = frequency
+        rows.append(auctions)
+    return pd.concat(rows, ignore_index=True).sort_values(["symbol", "bar_time"]).reset_index(drop=True) if rows else pd.DataFrame()

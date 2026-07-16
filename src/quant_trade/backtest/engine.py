@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,7 @@ class BacktestResult:
     trades: pd.DataFrame
     target_weights: pd.DataFrame
     metrics: dict[str, float]
+    artifacts: dict[str, Path] = field(default_factory=dict)
 
 
 def _panels(bars: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:

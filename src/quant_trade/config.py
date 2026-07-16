@@ -43,6 +43,10 @@ class MinuteConfig(BaseModel):
         r"(?P<symbol>\d{6})(?:[._-]?(?P<exchange>SH|SZ|BJ))?"
     )
     timestamp_convention: str = "source"
+    compression: str = "zstd"
+    compression_level: int = 6
+    chunk_rows: int = 250_000
+    row_group_rows: int = 250_000
 
 
 class BacktestConfig(BaseModel):
@@ -88,4 +92,3 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     cfg = AppConfig.model_validate(payload)
     cfg.ensure_directories()
     return cfg
-

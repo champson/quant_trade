@@ -13,6 +13,7 @@ import typer
 
 from quant_trade.config import load_config
 from quant_trade.data.minute_archive import MinuteArchiveImporter
+from quant_trade.data.minute_directory import MinuteDirectoryImporter
 from quant_trade.data.router import build_router
 from quant_trade.data.storage import DataStore
 from quant_trade.models import AssetType
@@ -31,7 +32,7 @@ from quant_trade.strategies import strategy_names
 
 app = typer.Typer(help="A股复盘、数据管理和策略研究平台", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载和导入", no_args_is_help=True)
-minute_app = typer.Typer(help="分钟 ZIP 数据", no_args_is_help=True)
+minute_app = typer.Typer(help="分钟ZIP与目录数据", no_args_is_help=True)
 strategy_app = typer.Typer(help="策略信号和回测", no_args_is_help=True)
 review_app = typer.Typer(help="市场复盘", no_args_is_help=True)
 daily_app = typer.Typer(help="每日流水线", no_args_is_help=True)
@@ -128,6 +129,72 @@ def minute_import_inbox(config: Annotated[str | None, typer.Option("--config")] 
     typer.echo(json.dumps([asdict(x) for x in results], ensure_ascii=False, indent=2))
 
 
+@minute_app.command("inspect-directory")
+def minute_inspect_directory(
+    path: Path,
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    cfg = load_config(config)
+    profile = MinuteDirectoryImporter(cfg, DataStore(cfg)).inspect_directory(path)
+    typer.echo(json.dumps(asdict(profile), ensure_ascii=False, indent=2))
+    if not profile.valid:
+        raise typer.Exit(2)
+
+
+@minute_app.command("import-directory")
+def minute_import_directory(
+    path: Path,
+    frequency: Annotated[str, typer.Option()] = "5min",
+    force: Annotated[bool, typer.Option("--force", help="忽略文件哈希并重新导入")] = False,
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    cfg = load_config(config)
+    importer = MinuteDirectoryImporter(cfg, DataStore(cfg))
+
+    def progress(index: int, total: int, item) -> None:
+        if index == 1 or index == total or index % 50 == 0 or item.status == "failed":
+            typer.echo(
+                f"[{index}/{total}] {item.symbol} {item.status} "
+                f"写入={item.rows_written:,} 过滤={item.rows_filtered:,}"
+            )
+
+    result = importer.import_directory(
+        path, frequency=frequency, resume=not force, progress=progress
+    )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+    if result.files_failed:
+        raise typer.Exit(2)
+
+
+@minute_app.command("verify")
+def minute_verify(
+    frequency: Annotated[str, typer.Option()] = "5min",
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    cfg = load_config(config)
+    store = DataStore(cfg)
+    with store.connect() as con:
+        summary = con.execute(
+            """
+            SELECT asset_type, COUNT(DISTINCT symbol) AS symbols,
+                   COUNT(*) AS partitions, SUM(rows) AS rows,
+                   MIN(min_time) AS min_time, MAX(max_time) AS max_time
+            FROM minute_partitions WHERE frequency = ?
+            GROUP BY asset_type ORDER BY asset_type
+            """,
+            [frequency],
+        ).df()
+        paths = con.execute(
+            "SELECT path FROM minute_partitions WHERE frequency = ?", [frequency]
+        ).fetchall()
+    missing = [path for (path,) in paths if not Path(path).exists()]
+    typer.echo(summary.to_string(index=False) if not summary.empty else "没有已导入分区")
+    typer.echo(f"\n缺失Parquet文件：{len(missing)}")
+    if missing:
+        typer.echo("\n".join(missing[:20]))
+        raise typer.Exit(2)
+
+
 @review_app.command("close")
 def review_close(
     as_of: Annotated[str | None, typer.Option()] = None,
@@ -171,6 +238,8 @@ def strategy_backtest(
     cfg = load_config(config)
     result = run_strategy_backtest(cfg, DataStore(cfg), name, start, end)
     typer.echo(json.dumps(result.metrics, ensure_ascii=False, indent=2))
+    typer.echo("\n报告产物：")
+    typer.echo(json.dumps({key: str(path) for key, path in result.artifacts.items()}, ensure_ascii=False, indent=2))
 
 
 @research_app.command("correlation")

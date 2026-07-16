@@ -17,6 +17,10 @@ class AssetType(StrEnum):
 
 class Frequency(StrEnum):
     MIN1 = "1min"
+    MIN5 = "5min"
+    MIN15 = "15min"
+    MIN30 = "30min"
+    MIN60 = "60min"
     DAY = "1d"
 
 

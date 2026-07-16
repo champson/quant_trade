@@ -49,6 +49,24 @@ def test_resampling_does_not_bridge_lunch(app_config):
     assert set(result["open"]) == {1, 10}
 
 
+def test_resampling_folds_1300_reopen_into_first_afternoon_bucket():
+    data = pd.DataFrame({
+        "symbol": ["510300.SH"] * 4,
+        "trade_date": ["2024-01-02"] * 4,
+        "bar_time": pd.to_datetime([
+            "2024-01-02 13:00", "2024-01-02 13:05",
+            "2024-01-02 13:10", "2024-01-02 13:15",
+        ]),
+        "open": [1, 2, 3, 4], "high": [2, 3, 4, 5],
+        "low": [1, 2, 3, 4], "close": [2, 3, 4, 5],
+        "volume": [1, 1, 1, 1], "amount": [1, 1, 1, 1],
+    })
+    result = resample_minutes(data, "15min")
+    assert len(result) == 1
+    assert result.iloc[0]["bar_time"] == pd.Timestamp("2024-01-02 13:15")
+    assert result.iloc[0]["open"] == 1
+
+
 def test_separate_date_and_clock_columns_are_combined(app_config):
     app_config.ensure_directories()
     path = app_config.minute.inbox / "split-time.zip"

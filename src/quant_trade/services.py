@@ -4,7 +4,7 @@ from datetime import date
 
 import pandas as pd
 
-from quant_trade.backtest import ExecutionConfig, run_weight_backtest
+from quant_trade.backtest import ExecutionConfig, run_weight_backtest, save_backtest_report
 from quant_trade.config import AppConfig
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
@@ -110,26 +110,28 @@ def run_strategy_backtest(
     strategy = get_strategy(name, cfg)
     targets = strategy.generate_targets(bars)
     bc = config.backtest
-    result = run_weight_backtest(bars, targets, ExecutionConfig(
+    execution = ExecutionConfig(
         initial_cash=bc.initial_cash, commission_rate=bc.commission_rate,
         stamp_duty_rate=bc.stamp_duty_rate, slippage_rate=bc.slippage_rate,
         risk_free_annual=bc.risk_free_annual,
-    ))
+    )
+    result = run_weight_backtest(bars, targets, execution)
     out_dir = config.paths.artifacts_dir / "backtests" / name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    result.equity.to_csv(out_dir / "equity.csv", header=True)
-    result.positions.to_csv(out_dir / "positions.csv")
-    result.trades.to_csv(out_dir / "trades.csv", index=False)
-    pd.Series(result.metrics).to_json(out_dir / "metrics.json", indent=2)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    (result.equity / result.equity.iloc[0]).plot(ax=ax, title=f"{name} backtest")
-    ax.set_ylabel("NAV")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / "equity.png", dpi=150)
-    plt.close(fig)
+    benchmark_name = cfg.get("benchmark")
+    benchmark_equity = None
+    if benchmark_name:
+        benchmark_bars = store.read_daily([benchmark_name], start, end)
+        if not benchmark_bars.empty:
+            closes = benchmark_bars.sort_values("trade_date").set_index("trade_date")["close"]
+            benchmark_equity = closes / closes.iloc[0] * execution.initial_cash
+    report_paths = save_backtest_report(
+        name=name,
+        result=result,
+        out_dir=out_dir,
+        execution=execution,
+        strategy_config=cfg,
+        benchmark_equity=benchmark_equity,
+        benchmark_name=benchmark_name,
+    )
+    result.artifacts = report_paths.as_dict()
     return result
