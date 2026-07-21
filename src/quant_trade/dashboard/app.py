@@ -23,6 +23,7 @@ def main() -> None:
 
     with tabs[0]:
         summary = _latest(list((cfg.paths.artifacts_dir / "reviews").glob("market_summary_*.json")))
+        breadth = _latest(list((cfg.paths.artifacts_dir / "reviews").glob("market_breadth_*.csv")))
         image = _latest(list((cfg.paths.artifacts_dir / "reviews").glob("market_breadth_*.png")))
         if summary:
             values = json.loads(summary.read_text(encoding="utf-8"))
@@ -36,7 +37,9 @@ def main() -> None:
                 if key.endswith("return") and isinstance(value, (float, int)):
                     value = f"{value:.2%}"
                 col.metric(label, value)
-        if image:
+        if breadth:
+            st.dataframe(pd.read_csv(breadth), width="stretch", hide_index=True)
+        elif image:
             st.image(str(image))
         if not summary:
             st.info("尚无复盘结果，请运行 qt daily run")
@@ -46,19 +49,23 @@ def main() -> None:
             latest = _latest(list(strategy_dir.glob("signal_*.csv")))
             if latest:
                 st.subheader(strategy_dir.name)
-                st.dataframe(pd.read_csv(latest), use_container_width=True)
+                st.dataframe(pd.read_csv(latest), width="stretch")
 
     with tabs[2]:
         for strategy_dir in sorted((cfg.paths.artifacts_dir / "backtests").glob("*")):
             st.subheader(strategy_dir.name)
-            report = strategy_dir / "report.html"
+            reports = list(strategy_dir.glob("*/report.html"))
+            report = _latest(reports) or strategy_dir / "report.html"
             if report.exists():
                 components.html(report.read_text(encoding="utf-8"), height=1100, scrolling=True)
             else:
-                if (strategy_dir / "metrics.json").exists():
-                    st.json(json.loads((strategy_dir / "metrics.json").read_text()))
-                if (strategy_dir / "equity.png").exists():
-                    st.image(str(strategy_dir / "equity.png"))
+                run_dirs = [path for path in strategy_dir.glob("*") if path.is_dir()]
+                latest_run = _latest(run_dirs)
+                result_dir = latest_run or strategy_dir
+                if (result_dir / "metrics.json").exists():
+                    st.json(json.loads((result_dir / "metrics.json").read_text()))
+                if (result_dir / "equity.png").exists():
+                    st.image(str(result_dir / "equity.png"))
 
     with tabs[3]:
         if cfg.paths.database.exists():
@@ -66,12 +73,12 @@ def main() -> None:
             st.subheader("最近运行")
             st.dataframe(
                 con.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").df(),
-                use_container_width=True,
+                width="stretch",
             )
             st.subheader("数据源请求")
             st.dataframe(
                 con.execute("SELECT * FROM data_fetches ORDER BY fetched_at DESC LIMIT 50").df(),
-                use_container_width=True,
+                width="stretch",
             )
             st.subheader("分钟文件导入")
             st.dataframe(
@@ -81,14 +88,14 @@ def main() -> None:
                     ORDER BY imported_at DESC LIMIT 50
                     """
                 ).df(),
-                use_container_width=True,
+                width="stretch",
             )
             st.subheader("分钟目录导入")
             st.dataframe(
                 con.execute(
                     "SELECT * FROM minute_import_runs ORDER BY started_at DESC LIMIT 30"
                 ).df(),
-                use_container_width=True,
+                width="stretch",
             )
             st.subheader("分钟数据覆盖")
             st.dataframe(
@@ -99,7 +106,7 @@ def main() -> None:
                 FROM minute_partitions
                 GROUP BY frequency, asset_type ORDER BY frequency, asset_type
             """).df(),
-                use_container_width=True,
+                width="stretch",
             )
             con.close()
         else:

@@ -118,6 +118,8 @@ def run_weight_backtest(
                 if side == "BUY":
                     affordable = cash / (exec_price * (1 + config.commission_rate))
                     quantity = min(quantity, affordable)
+                    if config.lot_size > 1:
+                        quantity = np.floor(quantity / config.lot_size) * config.lot_size
                     # A blocked sale can leave a dependent buy with no cash.
                     # Preserve every material unfilled remainder for the next
                     # open; never emit a zero-quantity trade.

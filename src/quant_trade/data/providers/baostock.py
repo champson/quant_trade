@@ -63,6 +63,8 @@ class BaoStockProvider(DataProvider):
                 start_date=pd.Timestamp(request.start).strftime("%Y-%m-%d"),
                 end_date=pd.Timestamp(request.end).strftime("%Y-%m-%d"),
             )
+            if rs.error_code != "0":
+                raise ProviderError(f"BaoStock 交易日历失败: {rs.error_msg}")
             rows = []
             while rs.error_code == "0" and rs.next():
                 rows.append(rs.get_row_data())

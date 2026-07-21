@@ -25,7 +25,7 @@ from quant_trade.services import (
     run_strategy_backtest,
     run_strategy_signal,
     update_bars,
-    update_daily_basic,
+    update_market_history,
 )
 from quant_trade.strategies import strategy_names
 
@@ -84,6 +84,11 @@ def data_update(
         raise typer.BadParameter(
             "全市场快照只支持 stock 或 convertible_bond", param_hint="--asset-type"
         )
+    if not codes and start_date != end_date:
+        raise typer.BadParameter(
+            "全市场 data update 只支持单日；历史回填请使用 qt data market-history",
+            param_hint="--start",
+        )
     cfg, store, router = _runtime(config)
     try:
         frame = update_bars(
@@ -118,24 +123,77 @@ def market_history(
     cfg, store, router = _runtime(config)
     try:
         days = trading_days(router, start_date, end_date, store)
-        for index, trade_date in enumerate(days, 1):
-            frame = update_bars(
-                cfg,
-                router,
-                store,
-                [],
-                trade_date,
-                trade_date,
-                AssetType.STOCK,
-                resume=not force,
-            )
-            if include_basic:
-                basic_path = store.daily_basic_path(str(trade_date))
-                if force or not basic_path.exists():
-                    update_daily_basic(router, store, trade_date)
-            typer.echo(f"[{index}/{len(days)}] {trade_date} {len(frame):,} 行")
+
+        def progress(index: int, total: int, trade_date: date, rows: int) -> None:
+            typer.echo(f"[{index}/{total}] {trade_date} {rows:,} 行")
+
+        update_market_history(
+            cfg,
+            router,
+            store,
+            days,
+            include_basic=include_basic,
+            force=force,
+            progress=progress,
+        )
     finally:
         router.close()
+
+
+@data_app.command("verify")
+def data_verify(
+    asset_type: Annotated[AssetType, typer.Option()] = AssetType.STOCK,
+    adjustment: Annotated[Adjustment, typer.Option()] = Adjustment.NONE,
+    start: Annotated[str | None, typer.Option()] = None,
+    end: Annotated[str | None, typer.Option()] = None,
+    mark_incomplete: Annotated[
+        bool,
+        typer.Option(
+            "--mark-incomplete/--no-mark-incomplete",
+            help="审计失败时撤销完整标记，避免下游继续使用损坏快照",
+        ),
+    ] = True,
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    """全量扫描已完成市场快照，核验每个成员确实包含目标交易日。"""
+    cfg = load_config(config)
+    store = DataStore(cfg)
+    results = store.audit_market_snapshots(
+        asset_type,
+        adjustment,
+        start=start,
+        end=end,
+        mark_incomplete=mark_incomplete,
+    )
+    basic_results = (
+        store.audit_daily_basic_snapshots(
+            start=start,
+            end=end,
+            mark_incomplete=mark_incomplete,
+        )
+        if asset_type == AssetType.STOCK and adjustment == Adjustment.NONE
+        else []
+    )
+    invalid = [item for item in results if item["status"] == "invalid"]
+    invalid_basic = [item for item in basic_results if item["status"] == "invalid"]
+    typer.echo(
+        json.dumps(
+            {
+                "snapshots": len(results),
+                "valid": len(results) - len(invalid),
+                "invalid": len(invalid),
+                "invalid_dates": [item["trade_date"] for item in invalid],
+                "daily_basic_snapshots": len(basic_results),
+                "daily_basic_invalid": len(invalid_basic),
+                "daily_basic_invalid_dates": [item["trade_date"] for item in invalid_basic],
+                "marked_incomplete": bool((invalid or invalid_basic) and mark_incomplete),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if invalid or invalid_basic:
+        raise typer.Exit(2)
 
 
 @minute_app.command("inspect")
@@ -175,6 +233,8 @@ def minute_import_inbox(
         asset_type=asset_type or cfg.minute.inbox_asset_type,
     )
     typer.echo(json.dumps([asdict(x) for x in results], ensure_ascii=False, indent=2))
+    if any(result.status == "failed" for result in results):
+        raise typer.Exit(2)
 
 
 @minute_app.command("inspect-directory")
@@ -232,14 +292,12 @@ def minute_verify(
             """,
             [frequency],
         ).df()
-        paths = con.execute(
-            "SELECT path FROM minute_partitions WHERE frequency = ?", [frequency]
-        ).fetchall()
-    missing = [path for (path,) in paths if not Path(path).exists()]
+    audit = store.audit_minute_partitions(frequency)
+    invalid = [item for item in audit if item["status"] == "invalid"]
     typer.echo(summary.to_string(index=False) if not summary.empty else "没有已导入分区")
-    typer.echo(f"\n缺失Parquet文件：{len(missing)}")
-    if missing:
-        typer.echo("\n".join(missing[:20]))
+    typer.echo(f"\n深度校验失败分区：{len(invalid)}")
+    if invalid:
+        typer.echo("\n".join(f"{item['path']}: {item['reason']}" for item in invalid[:20]))
         raise typer.Exit(2)
 
 
@@ -250,10 +308,40 @@ def review_close(
 ) -> None:
     cfg = load_config(config)
     store = DataStore(cfg)
-    bars = store.read_daily([], None, as_of, asset_type=AssetType.STOCK, adjustment="none")
+    requested_as_of = as_of
+    if requested_as_of is None:
+        latest_complete = store.latest_complete_market_snapshot_date(AssetType.STOCK)
+        if latest_complete is None:
+            raise typer.BadParameter("没有完整的股票快照，请先执行 qt data update")
+        requested_as_of = str(latest_complete)
+    target_day = pd.Timestamp(requested_as_of).date()
+    if not store.market_snapshot_complete(AssetType.STOCK, target_day):
+        raise typer.BadParameter(
+            f"复盘目标日缺少完整全市场快照: {target_day}",
+            param_hint="--as-of",
+        )
+    bars = store.read_daily(
+        [], None, requested_as_of, asset_type=AssetType.STOCK, adjustment="none"
+    )
     if bars.empty:
         raise typer.BadParameter("没有股票行情，请先执行 qt data update")
-    report = build_market_review(bars, as_of)
+    report = build_market_review(bars, requested_as_of)
+    if report.as_of.normalize() != pd.Timestamp(requested_as_of).normalize():
+        raise typer.BadParameter(
+            f"请求 {pd.Timestamp(requested_as_of).date()}，本地最新复盘数据为 "
+            f"{report.as_of.date()}；"
+            "请先补齐该日全市场快照",
+            param_hint="--as-of",
+        )
+    required_dates = {value.date() for value in report.anchor_dates.values()}
+    incomplete = sorted(
+        day for day in required_dates if not store.market_snapshot_complete(AssetType.STOCK, day)
+    )
+    if incomplete:
+        raise typer.BadParameter(
+            "复盘目标日或收益锚点缺少完整全市场快照: " + ", ".join(str(day) for day in incomplete),
+            param_hint="--as-of",
+        )
     outputs = save_market_review(report, cfg.paths.artifacts_dir / "reviews")
     typer.echo(json.dumps({k: str(v) for k, v in outputs.items()}, ensure_ascii=False, indent=2))
 

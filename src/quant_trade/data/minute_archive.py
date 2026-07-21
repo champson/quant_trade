@@ -33,6 +33,15 @@ ALIASES = {
 }
 
 
+def apply_timestamp_convention(timestamps: pd.Series, frequency: str, convention: str) -> pd.Series:
+    """Normalize imported timestamps to the canonical bar-end convention."""
+    if convention == "bar_start":
+        return timestamps + pd.Timedelta(minutes=int(frequency.removesuffix("min")))
+    if convention in {"source", "bar_end"}:
+        return timestamps
+    raise ValueError(f"不支持的 timestamp_convention: {convention}")
+
+
 @dataclass
 class ArchiveProfile:
     encoding: str
@@ -111,7 +120,10 @@ class MinuteArchiveImporter:
     def inspect(self, path: str | Path) -> ArchiveProfile:
         path = Path(path)
         with zipfile.ZipFile(path) as archive:
-            members = self._safe_members(archive)
+            members = sorted(self._safe_members(archive), key=lambda item: item.filename)
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise DataQualityError("ZIP 包含重复成员路径")
             with archive.open(members[0]) as handle:
                 raw = handle.read(128 * 1024)
             sample, encoding = self._decode_sample(raw)
@@ -133,7 +145,7 @@ class MinuteArchiveImporter:
             return ArchiveProfile(
                 encoding=encoding,
                 delimiter=delimiter,
-                members=[m.filename for m in members],
+                members=names,
                 columns=mapping,
                 sample_rows=max(0, len(sample.splitlines()) - 1),
                 timestamp_convention=self.config.minute.timestamp_convention,
@@ -157,10 +169,10 @@ class MinuteArchiveImporter:
                 raise ValueError("asset_type 只支持 auto/stock/etf/index")
             return requested
         code, _, exchange = symbol.partition(".")
-        if code.startswith(("5", "15")):
-            return "etf"
-        if code.startswith("399") or (exchange == "SH" and code.startswith("000")):
+        if code.startswith(("399", "93")) or (exchange == "SH" and code.startswith("000")):
             return "index"
+        if code.startswith(("5", "15", "16")):
+            return "etf"
         return "stock"
 
     @staticmethod
@@ -206,14 +218,20 @@ class MinuteArchiveImporter:
             out["bar_time"] = pd.to_datetime(raw_time, errors="coerce")
         elif "trade_date" in out:
             out["bar_time"] = pd.to_datetime(out["trade_date"], errors="coerce")
-        if "trade_date" in out and out["bar_time"].isna().any():
-            out["bar_time"] = pd.to_datetime(out["trade_date"].astype(str), errors="coerce")
-        out["trade_date"] = out["bar_time"].dt.date
+        out["bar_time"] = apply_timestamp_convention(
+            out["bar_time"], frequency, profile.timestamp_convention
+        )
         for col in ("open", "high", "low", "close", "volume", "amount"):
             if col not in out:
                 out[col] = pd.NA
             out[col] = pd.to_numeric(out[col], errors="coerce")
-        out = out.dropna(subset=["symbol", "bar_time", "open", "high", "low", "close", "volume"])
+        invalid = (
+            out[["symbol", "bar_time", "open", "high", "low", "close", "volume"]].isna().any(axis=1)
+        )
+        invalid |= ~out["symbol"].str.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", na=False)
+        if invalid.any():
+            raise DataQualityError(f"{member} 存在 {int(invalid.sum())} 条无法解析的记录")
+        out["trade_date"] = out["bar_time"].dt.date
         member_category = next(
             (
                 part.lower()
@@ -250,12 +268,32 @@ class MinuteArchiveImporter:
         ]
 
     @staticmethod
+    def _validate_time_grid(frame: pd.DataFrame, frequency: str, asset_type: str) -> None:
+        minutes = int(frequency.removesuffix("min"))
+        timestamps = frame["bar_time"]
+        clock_minutes = timestamps.dt.hour * 60 + timestamps.dt.minute
+        auction = asset_type == "stock" and clock_minutes.eq(9 * 60 + 30)
+        am_elapsed = clock_minutes - (9 * 60 + 30)
+        pm_elapsed = clock_minutes - (13 * 60)
+        regular = ((am_elapsed > 0) & (am_elapsed <= 120) & am_elapsed.mod(minutes).eq(0)) | (
+            (pm_elapsed >= 0) & (pm_elapsed <= 120) & pm_elapsed.mod(minutes).eq(0)
+        )
+        invalid = ~(regular | auction)
+        if invalid.any():
+            examples = frame.loc[invalid, "bar_time"].head(3).astype(str).tolist()
+            raise DataQualityError(f"存在不符合{frequency}交易时段的时间: {examples}")
+
+    @staticmethod
     def _normalize_symbol(value: str) -> str:
         value = value.upper().replace(" ", "")
         if "." in value:
             code, exchange = value.split(".", 1)
             if code in {"SH", "SZ", "BJ"}:
                 code, exchange = exchange, code
+            # Tushare index archives sometimes use the vendor-only CSI suffix.
+            # Persist the canonical exchange suffix used by the rest of the store.
+            if exchange == "CSI":
+                exchange = "SH"
             return f"{code}.{exchange}"
         return f"{value}.{'SH' if value.startswith(('5', '6', '9')) else 'SZ'}"
 
@@ -274,8 +312,52 @@ class MinuteArchiveImporter:
         path = Path(path)
         file_hash = self.hash_file(path)
         if self.store.minute_imported(file_hash, frequency, asset_type):
+            destination = self.config.minute.archive / path.name
+            if path.resolve() != destination.resolve():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    destination = destination.with_name(f"{file_hash[:8]}_{destination.name}")
+                shutil.move(str(path), destination)
             return ImportResult(file_hash, path.name, "skipped", warnings=["文件已导入"])
-        profile = profile or self.inspect(path)
+        try:
+            profile = profile or self.inspect(path)
+        except Exception as exc:
+            result = ImportResult(file_hash, path.name, "failed", warnings=[str(exc)])
+            self.store.record_minute_import(
+                {
+                    "file_hash": file_hash,
+                    "frequency": frequency,
+                    "asset_type": asset_type,
+                    "file_name": path.name,
+                    "status": "failed",
+                    "details": {"warnings": result.warnings, "phase": "preflight"},
+                    "members": [],
+                }
+            )
+            destination = self.config.minute.quarantine / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if path.resolve() != destination.resolve():
+                if destination.exists():
+                    destination = destination.with_name(f"{file_hash[:8]}_{destination.name}")
+                try:
+                    shutil.move(str(path), destination)
+                except OSError as move_exc:
+                    result.warnings.append(f"隔离失败: {move_exc}")
+                    self.store.record_minute_import(
+                        {
+                            "file_hash": file_hash,
+                            "frequency": frequency,
+                            "asset_type": asset_type,
+                            "file_name": path.name,
+                            "status": "failed",
+                            "details": {
+                                "warnings": result.warnings,
+                                "phase": "preflight",
+                            },
+                            "members": [],
+                        }
+                    )
+            raise DataQualityError("; ".join(result.warnings)) from exc
         result = ImportResult(file_hash, path.name, "failed", warnings=list(profile.warnings))
         min_time = None
         max_time = None
@@ -285,6 +367,8 @@ class MinuteArchiveImporter:
         statistics: dict[tuple[str, int], dict] = {}
         symbol_assets: dict[str, str] = {}
         previous_times: dict[str, pd.Timestamp] = {}
+        committed_members: list[tuple[str, int, int, pd.Timestamp, pd.Timestamp]] = []
+        archive_recorded = False
         try:
             staging.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(path) as archive:
@@ -314,7 +398,12 @@ class MinuteArchiveImporter:
                                 for symbol, symbol_frame in normalized.groupby(
                                     "symbol", sort=False
                                 ):
-                                    symbol_frame = symbol_frame.sort_values("bar_time")
+                                    if not symbol_frame["bar_time"].is_monotonic_increasing:
+                                        raise DataQualityError(
+                                            f"{symbol} 的分钟K线未按时间升序排列"
+                                        )
+                                    actual_asset = str(symbol_frame["asset_type"].iloc[0])
+                                    self._validate_time_grid(symbol_frame, frequency, actual_asset)
                                     if symbol in previous_times and (
                                         symbol_frame["bar_time"].iloc[0] <= previous_times[symbol]
                                     ):
@@ -322,7 +411,6 @@ class MinuteArchiveImporter:
                                             f"{symbol} 在ZIP成员或分块边界存在重复/倒序K线"
                                         )
                                     previous_times[symbol] = symbol_frame["bar_time"].iloc[-1]
-                                    actual_asset = str(symbol_frame["asset_type"].iloc[0])
                                     symbol_assets[symbol] = actual_asset
                                     for year, part in symbol_frame.groupby(
                                         symbol_frame["bar_time"].dt.year
@@ -381,61 +469,104 @@ class MinuteArchiveImporter:
             for writer in writers.values():
                 writer.close()
             writers.clear()
-            entries = []
-            for symbol in sorted(symbol_assets):
-                years = {
-                    year: staged[(symbol, year)]
-                    for item_symbol, year in staged
-                    if item_symbol == symbol
-                }
-                stats = {
-                    year: statistics[(symbol, year)]
-                    for item_symbol, year in statistics
-                    if item_symbol == symbol
-                }
-                entries.append(
-                    {
-                        "frequency": frequency,
-                        "symbol": symbol,
-                        "asset_type": symbol_assets[symbol],
-                        "staged": years,
-                        "statistics": stats,
-                        "source_hash": file_hash,
-                        # A ZIP may be an incremental delivery. Preserve years
-                        # not represented by this archive.
-                        "replace_symbol": False,
+            archive_statistics = {key: dict(value) for key, value in statistics.items()}
+            with self.store.minute_write_lock():
+                for (symbol, year), incoming in list(staged.items()):
+                    existing = self.store.minute_symbol_year_path(frequency, symbol, year)
+                    if not existing.exists():
+                        continue
+                    merged = (
+                        staging / "merged" / self.store.safe_symbol(symbol) / f"year={year}.parquet"
+                    )
+                    statistics[(symbol, year)] = self.store.merge_minute_partition(
+                        existing, incoming, merged
+                    )
+                    staged[(symbol, year)] = merged
+                entries = []
+                for symbol in sorted(symbol_assets):
+                    years = {
+                        year: staged[(symbol, year)]
+                        for item_symbol, year in staged
+                        if item_symbol == symbol
                     }
+                    stats = {
+                        year: statistics[(symbol, year)]
+                        for item_symbol, year in statistics
+                        if item_symbol == symbol
+                    }
+                    entries.append(
+                        {
+                            "frequency": frequency,
+                            "symbol": symbol,
+                            "asset_type": symbol_assets[symbol],
+                            "staged": years,
+                            "statistics": stats,
+                            "source_hash": file_hash,
+                            # A ZIP may be an incremental delivery. Preserve years
+                            # not represented by this archive.
+                            "replace_symbol": False,
+                        }
+                    )
+                committed_members = [
+                    (
+                        symbol,
+                        year,
+                        int(archive_statistics[(symbol, year)]["rows"]),
+                        archive_statistics[(symbol, year)]["min_time"],
+                        archive_statistics[(symbol, year)]["max_time"],
+                    )
+                    for symbol, year in sorted(staged)
+                ]
+                result.min_time = str(min_time)
+                result.max_time = str(max_time)
+                archive_record = {
+                    "file_hash": file_hash,
+                    "frequency": frequency,
+                    "asset_type": asset_type,
+                    "file_name": path.name,
+                    "rows": result.rows,
+                    "min_time": result.min_time,
+                    "max_time": result.max_time,
+                    "status": "success",
+                    "details": {"warnings": result.warnings, "profile": asdict(profile)},
+                    "members": committed_members,
+                }
+                self.store.commit_minute_batch(
+                    entries,
+                    assume_locked=True,
+                    archive_record=archive_record,
                 )
-            self.store.commit_minute_batch(entries)
-            result.status = "success"
-            result.min_time = str(min_time)
-            result.max_time = str(max_time)
+                archive_recorded = True
+                result.status = "success"
             destination = self.config.minute.archive / path.name
         except Exception as exc:
+            result.status = "failed"
             result.warnings.append(str(exc))
             destination = self.config.minute.quarantine / path.name
         finally:
             for writer in writers.values():
                 writer.close()
             shutil.rmtree(staging, ignore_errors=True)
+        if not archive_recorded:
+            self.store.record_minute_import(
+                {
+                    "file_hash": file_hash,
+                    "frequency": frequency,
+                    "asset_type": asset_type,
+                    "file_name": path.name,
+                    "rows": result.rows,
+                    "min_time": result.min_time,
+                    "max_time": result.max_time,
+                    "status": result.status,
+                    "details": {"warnings": result.warnings, "profile": asdict(profile)},
+                    "members": committed_members,
+                }
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path.resolve() != destination.resolve():
             if destination.exists():
                 destination = destination.with_name(f"{file_hash[:8]}_{destination.name}")
             shutil.move(str(path), destination)
-        self.store.record_minute_import(
-            {
-                "file_hash": file_hash,
-                "frequency": frequency,
-                "asset_type": asset_type,
-                "file_name": path.name,
-                "rows": result.rows,
-                "min_time": result.min_time,
-                "max_time": result.max_time,
-                "status": result.status,
-                "details": {"warnings": result.warnings, "profile": asdict(profile)},
-            }
-        )
         if result.status == "failed":
             raise DataQualityError("; ".join(result.warnings))
         return result
@@ -449,7 +580,7 @@ class MinuteArchiveImporter:
                 results.append(
                     self.import_archive(path, frequency=frequency, asset_type=asset_type)
                 )
-            except DataQualityError as exc:
+            except Exception as exc:
                 results.append(ImportResult("", path.name, "failed", warnings=[str(exc)]))
         return results
 

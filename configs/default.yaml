@@ -12,6 +12,11 @@ providers:
     stock: 4500
     convertible_bond: 250
   market_snapshot_reference_ratio: 0.9
+  # 写入时确定性抽检；qt data verify 执行全量内容审计
+  market_snapshot_validation_sample_size: 32
+  market_snapshot_cache_ttl_seconds: 60
+  # 历史全市场回填先累计多个交易日，再批量合并各证券文件
+  market_history_batch_days: 20
   retry:
     attempts: 6
     delays: [2, 5, 10, 20, 40, 60]
@@ -37,6 +42,7 @@ minute:
   compression_level: 6
   chunk_rows: 250000
   row_group_rows: 250000
+  fail_daily_on_import_error: true
 
 backtest:
   initial_cash: 1000000
@@ -44,6 +50,7 @@ backtest:
   stamp_duty_rate: 0.0005
   slippage_rate: 0.0002
   risk_free_annual: 0.015
+  lot_size: 100
 
 strategies:
   etf_rotation:
@@ -55,7 +62,6 @@ strategies:
     ma_window: 28
     hold_num: 1
     rebalance_days: 5
-    rebalance_anchor: 2000-01-03
     benchmark: 510300.SH
     benchmark_asset_type: etf
     benchmark_adjustment: hfq

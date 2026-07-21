@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from quant_trade.data.base import DataProvider
+from quant_trade.data.minute_archive import ImportResult
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
 from quant_trade.models import Adjustment, AssetType, DataBatch, Dataset
@@ -53,6 +56,14 @@ class OfflineMarketProvider(DataProvider):
         return DataBatch(pd.DataFrame(rows), self.name, request)
 
 
+class PartialConvertibleProvider(OfflineMarketProvider):
+    def fetch(self, request):
+        batch = super().fetch(request)
+        if request.dataset == Dataset.BARS and request.asset_type == AssetType.CONVERTIBLE_BOND:
+            return DataBatch(batch.data.iloc[:1].copy(), self.name, request)
+        return batch
+
+
 def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
     app_config.providers.market_snapshot_min_symbols = {"stock": 2, "convertible_bond": 2}
     app_config.review = {"indices": {}}
@@ -68,6 +79,44 @@ def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
     with store.connect() as con:
         status = con.execute("SELECT status FROM runs").fetchone()[0]
     assert status == "success"
+
+
+def test_daily_pipeline_omits_incomplete_convertible_bond_report(app_config, monkeypatch):
+    app_config.providers.market_snapshot_min_symbols = {"stock": 2, "convertible_bond": 2}
+    app_config.review = {"indices": {}}
+    app_config.strategies = {}
+    app_config.providers.priority = ["partial"]
+    store = DataStore(app_config)
+    router = DataRouter(app_config, {"partial": PartialConvertibleProvider()}, store)
+    monkeypatch.setattr("quant_trade.pipelines.daily.notify", lambda *_: None)
+
+    result = run_daily(app_config, router, store, date(2024, 1, 8))
+
+    assert "convertible_bonds" not in result.report_paths
+    assert any("可转债报告已跳过，快照不完整" in warning for warning in result.warnings)
+
+
+def test_daily_pipeline_fails_when_minute_inbox_contains_failed_archive(app_config, monkeypatch):
+    app_config.providers.market_snapshot_min_symbols = {
+        "stock": 2,
+        "convertible_bond": 2,
+    }
+    app_config.review = {"indices": {}}
+    app_config.strategies = {}
+    app_config.providers.priority = ["offline"]
+    store = DataStore(app_config)
+    router = DataRouter(app_config, {"offline": OfflineMarketProvider()}, store)
+    monkeypatch.setattr("quant_trade.pipelines.daily.notify", lambda *_: None)
+    monkeypatch.setattr(
+        "quant_trade.pipelines.daily.MinuteArchiveImporter.import_inbox",
+        lambda *_args, **_kwargs: [ImportResult("bad", "broken.zip", "failed")],
+    )
+
+    with pytest.raises(DataQualityError, match="broken.zip"):
+        run_daily(app_config, router, store, date(2024, 1, 8))
+    with store.connect() as con:
+        status = con.execute("SELECT status FROM runs").fetchone()[0]
+    assert status == "failed"
 
 
 def test_strategy_download_groups_honour_asset_and_benchmark_types():

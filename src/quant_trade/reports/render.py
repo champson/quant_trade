@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 from pathlib import Path
-import warnings
 
 import pandas as pd
 
 from quant_trade.reports.market_review import MarketReview
+
+
+CHINESE_FONT_CANDIDATES = (
+    "Hiragino Sans GB",
+    "PingFang SC",
+    "Heiti SC",
+    "Arial Unicode MS",
+    "Noto Sans CJK SC",
+    "Source Han Sans SC",
+    "Microsoft YaHei",
+    "SimHei",
+    "WenQuanYi Micro Hei",
+)
+
+
+def _chinese_font_properties():
+    from matplotlib import font_manager
+
+    installed = {font.name: font.fname for font in font_manager.fontManager.ttflist}
+    for name in CHINESE_FONT_CANDIDATES:
+        if path := installed.get(name):
+            return font_manager.FontProperties(fname=path)
+    return font_manager.FontProperties()
 
 
 def save_market_review(
@@ -22,6 +44,8 @@ def save_market_review(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    chinese_font = _chinese_font_properties()
+    matplotlib.rcParams["axes.unicode_minus"] = False
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = review.as_of.strftime("%Y-%m-%d")
     csv_path = out_dir / f"market_breadth_{stamp}.csv"
@@ -40,11 +64,11 @@ def save_market_review(
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.scale(1, 1.5)
-    ax.set_title(f"A股市场宽度 {stamp}")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Glyph .* missing from font")
-        fig.tight_layout()
-        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    for cell in table.get_celld().values():
+        cell.get_text().set_fontproperties(chinese_font)
+    ax.set_title(f"A股市场宽度 {stamp}", fontproperties=chinese_font)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     outputs = {"csv": csv_path, "png": png_path, "summary": summary_path}
     extras = {

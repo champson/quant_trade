@@ -24,6 +24,7 @@ class MarketReview:
     breadth: pd.DataFrame
     summary: dict[str, float | int | str]
     returns: pd.DataFrame
+    anchor_dates: dict[str, pd.Timestamp]
 
 
 def _nearest_on_or_before(dates: pd.DatetimeIndex, target: pd.Timestamp) -> pd.Timestamp:
@@ -51,23 +52,27 @@ def build_market_review(
         "今年": latest.replace(month=1, day=1) - pd.Timedelta(days=1),
     }
     returns: dict[str, pd.Series] = {}
+    resolved_anchors: dict[str, pd.Timestamp] = {}
     for name, anchor in anchors.items():
         base = _nearest_on_or_before(close.index, anchor)
+        resolved_anchors[name] = base
         returns[name] = close.loc[latest] / close.loc[base] - 1
     ret = pd.DataFrame(returns)
     rows = []
     for label, lower, upper in BUCKETS:
         row = {"区间": label}
         for period in ret.columns:
-            values = ret[period].dropna()
+            # Price division introduces binary noise around exact 3/5/7%
+            # boundaries; normalize it before applying the documented bins.
+            values = ret[period].dropna().round(12)
             if lower == upper == 0.0:
                 mask = values == 0.0
             elif lower == -float("inf"):
-                mask = values <= upper
+                mask = values < upper
             elif upper == float("inf"):
                 mask = values > lower
-            elif upper == 0.0:
-                mask = (values > lower) & (values < upper)
+            elif upper <= 0.0:
+                mask = (values >= lower) & (values < upper)
             else:
                 mask = (values > lower) & (values <= upper)
             row[period] = int(mask.sum())
@@ -82,7 +87,7 @@ def build_market_review(
         "median_return": float(day.median()),
         "mean_return": float(day.mean()),
     }
-    return MarketReview(latest, pd.DataFrame(rows), summary, ret)
+    return MarketReview(latest, pd.DataFrame(rows), summary, ret, resolved_anchors)
 
 
 def period_returns(bars: pd.DataFrame, as_of: str | pd.Timestamp | None = None) -> pd.DataFrame:
@@ -111,6 +116,11 @@ def portfolio_returns(
 
     holdings["symbol"] = holdings[code_col].map(normalize)
     holdings["weight"] = pd.to_numeric(holdings[weight_col], errors="coerce").fillna(0)
+    missing = sorted(set(holdings["symbol"]) - set(ret.index))
+    if missing:
+        raise ValueError("组合持仓缺少复盘行情: " + ", ".join(missing))
+    if holdings["weight"].sum() <= 0:
+        raise ValueError("组合权重合计必须大于0")
     holdings["weight"] /= holdings["weight"].sum()
     available = holdings.set_index("symbol")["weight"].reindex(ret.index).dropna()
     if available.empty:

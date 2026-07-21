@@ -267,7 +267,7 @@ def save_backtest_report(
         ["手续费、印花税、滑点", "已建模"],
         ["涨跌停、停牌", "未建模"],
         ["T+1", "未建模"],
-        ["整数股 / 100股一手", "由 lot_size 配置；默认未启用100股约束"],
+        ["整数手", f"已建模：每笔成交按 lot_size={execution.lot_size} 向下取整"],
         ["财务公告时点", "由策略输入数据负责；引擎未独立校验"],
         ["退市与生存者偏差", "取决于股票池数据；引擎未独立校验"],
     ]
@@ -292,6 +292,7 @@ def save_backtest_report(
 | 佣金率 | {execution.commission_rate:.4%} |
 | 卖出印花税率 | {execution.stamp_duty_rate:.4%} |
 | 滑点率 | {execution.slippage_rate:.4%} |
+| 每手数量 | {execution.lot_size} |
 
 策略配置：
 
@@ -362,7 +363,7 @@ img{{display:block;width:100%;height:auto;margin:18px 0}} pre{{background:#f5f7f
 <h1>{html.escape(name)} 回测报告</h1><div class="muted">{start.date()} 至 {end.date()} · 自动生成于 {html.escape(generated_at)}</div>
 <div class="cards">{summary_cards}</div>
 <h2>策略与回测设置</h2>
-{_html_table(["项目", "内容"], [["初始资金", f"{execution.initial_cash:,.2f}"], ["期末权益", f"{result.equity.iloc[-1]:,.2f}"], ["比较基准", benchmark_label], ["佣金 / 印花税 / 滑点", f"{execution.commission_rate:.4%} / {execution.stamp_duty_rate:.4%} / {execution.slippage_rate:.4%}"]])}
+{_html_table(["项目", "内容"], [["初始资金", f"{execution.initial_cash:,.2f}"], ["期末权益", f"{result.equity.iloc[-1]:,.2f}"], ["比较基准", benchmark_label], ["佣金 / 印花税 / 滑点", f"{execution.commission_rate:.4%} / {execution.stamp_duty_rate:.4%} / {execution.slippage_rate:.4%}"], ["每手数量", str(execution.lot_size)]])}
 <details><summary>策略配置</summary><pre>{html.escape(config_text)}</pre></details>
 <h2>净值与回撤</h2><img alt="净值与回撤" src="{_image_data(equity_chart)}">
 <h2>核心绩效</h2>{_html_table(["指标", "策略", "基准"], metric_rows)}

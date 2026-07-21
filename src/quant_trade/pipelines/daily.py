@@ -7,8 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from quant_trade.config import AppConfig
+from quant_trade.data.base import EmptyDataError, ProviderError
 from quant_trade.data.calendar import trading_days
 from quant_trade.data.minute_archive import MinuteArchiveImporter
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
 from quant_trade.models import Adjustment, AssetType
@@ -87,14 +89,39 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
         calendar = trading_days(router, date(as_of.year - 1, 12, 1), as_of, store)
         snapshot_dates = _anchors(calendar, as_of)
         for snapshot in snapshot_dates:
-            if config.strategies.get("microcap", {}).get("enabled"):
-                update_daily_basic(router, store, snapshot)
+            microcap_enabled = bool(config.strategies.get("microcap", {}).get("enabled"))
+            if not store.daily_basic_complete(snapshot):
+                try:
+                    update_daily_basic(
+                        router,
+                        store,
+                        snapshot,
+                        reference_ratio=config.providers.market_snapshot_reference_ratio,
+                    )
+                except (EmptyDataError, ProviderError) as exc:
+                    if microcap_enabled:
+                        raise
+                    result.warnings.append(f"daily_basic 获取失败 {snapshot}: {exc}")
             update_bars(config, router, store, [], snapshot, snapshot, AssetType.STOCK)
+            if microcap_enabled and not store.daily_basic_complete(snapshot):
+                basic_count = store.daily_basic_symbol_count(snapshot)
+                market_count = store.market_snapshot_symbol_count(AssetType.STOCK, snapshot)
+                expected = (
+                    max(
+                        1,
+                        int(market_count * config.providers.market_snapshot_reference_ratio),
+                    )
+                    if market_count
+                    else 0
+                )
+                raise DataQualityError(
+                    f"{snapshot} daily_basic 不完整：{basic_count} 个证券，至少需要 {expected}"
+                )
             try:
                 update_bars(
                     config, router, store, [], snapshot, snapshot, AssetType.CONVERTIBLE_BOND
                 )
-            except Exception as exc:
+            except (EmptyDataError, ProviderError, DataQualityError) as exc:
                 result.warnings.append(f"可转债快照失败 {snapshot}: {exc}")
 
         index_codes = list((config.review.get("indices") or {}).values())
@@ -136,11 +163,42 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
             asset_type=config.minute.inbox_asset_type,
         )
         result.minute_imports = [r.__dict__ for r in imported]
+        failed_minute_imports = [item for item in imported if item.status == "failed"]
+        if failed_minute_imports:
+            message = "分钟 ZIP 导入失败: " + ", ".join(
+                item.file_name for item in failed_minute_imports
+            )
+            result.warnings.append(message)
+            if config.minute.fail_daily_on_import_error:
+                raise DataQualityError(message)
 
-        market = store.read_daily(
-            [], None, str(as_of), asset_type=AssetType.STOCK, adjustment="none"
+        incomplete_snapshot_dates = [
+            day
+            for day in snapshot_dates
+            if not store.market_snapshot_complete(AssetType.STOCK, day)
+        ]
+        if incomplete_snapshot_dates:
+            raise DataQualityError(
+                "复盘目标日或收益锚点快照不完整: "
+                + ", ".join(str(day) for day in incomplete_snapshot_dates)
+            )
+        market = store.read_daily_dates(
+            [], snapshot_dates, asset_type=AssetType.STOCK, adjustment="none"
         )
         review = build_market_review(market, as_of)
+        required_review_dates = {review.as_of.date()} | {
+            value.date() for value in review.anchor_dates.values()
+        }
+        incomplete_review_dates = sorted(
+            day
+            for day in required_review_dates
+            if not store.market_snapshot_complete(AssetType.STOCK, day)
+        )
+        if incomplete_review_dates:
+            raise DataQualityError(
+                "复盘目标日或收益锚点快照不完整: "
+                + ", ".join(str(day) for day in incomplete_review_dates)
+            )
         index_bars = (
             store.read_daily(
                 index_codes,
@@ -160,16 +218,24 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
         portfolio_file = config.review.get("portfolio_file")
         if portfolio_file and Path(portfolio_file).exists():
             portfolio = portfolio_returns(market, pd.read_csv(portfolio_file, dtype=str), as_of)
-        cb_bars = store.read_daily(
-            [],
-            None,
-            str(as_of),
-            asset_type=AssetType.CONVERTIBLE_BOND,
-            adjustment="none",
-        )
         cb_summary = None
-        if not cb_bars.empty:
-            cb_summary = asset_return_summary(cb_bars, as_of)
+        incomplete_cb_dates = store.incomplete_market_snapshot_dates(
+            AssetType.CONVERTIBLE_BOND, snapshot_dates
+        )
+        if incomplete_cb_dates:
+            result.warnings.append(
+                "可转债报告已跳过，快照不完整: "
+                + ", ".join(str(day) for day in incomplete_cb_dates)
+            )
+        else:
+            cb_bars = store.read_daily_dates(
+                [],
+                snapshot_dates,
+                asset_type=AssetType.CONVERTIBLE_BOND,
+                adjustment="none",
+            )
+            if not cb_bars.empty:
+                cb_summary = asset_return_summary(cb_bars, as_of)
         bias = None
         if bias_codes:
             bias_bars = store.read_daily(
