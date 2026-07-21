@@ -25,7 +25,9 @@ class LogBiasStrategy(Strategy):
             value = bias.loc[date]
             # Overheat only blocks new entries; existing holdings stay until
             # bias falls to the stop level. This asymmetry is intentional.
-            held = ((held & (value > stop)) | ((value >= entry) & (value < overheat))).fillna(False)
+            observed = value.notna()
+            next_held = (held & (value > stop)) | ((~held) & (value >= entry) & (value < overheat))
+            held.loc[observed] = next_held.loc[observed]
             selected = held[held].index
             if len(selected):
                 targets.loc[date, selected] = 1.0 / len(selected)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+import pytest
 
 from quant_trade.backtest import ExecutionConfig, run_weight_backtest, save_backtest_report
 
@@ -48,4 +49,47 @@ def test_backtest_report_writes_markdown_and_self_contained_html(tmp_path):
     assert "data:image/png;base64," in html
     assert "月度表现" in html
     payload = json.loads(paths.metrics.read_text(encoding="utf-8"))
-    assert set(payload) == {"strategy", "benchmark", "benchmark_name"}
+    assert set(payload) == {
+        "strategy",
+        "benchmark",
+        "benchmark_name",
+        "benchmark_status",
+        "benchmark_period",
+    }
+    assert payload["benchmark_period"] == {
+        "start": "2024-01-02",
+        "end": "2024-03-04",
+    }
+
+
+def test_backtest_report_failure_does_not_publish_partial_directory(tmp_path, monkeypatch):
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    bars = pd.DataFrame(
+        {
+            "trade_date": dates,
+            "symbol": ["A"] * 3,
+            "open": [10.0, 10.1, 10.2],
+            "close": [10.0, 10.1, 10.2],
+        }
+    )
+    result = run_weight_backtest(
+        bars,
+        pd.DataFrame({"A": [1.0]}, index=[dates[0]]),
+        ExecutionConfig(),
+    )
+    out_dir = tmp_path / "run"
+    monkeypatch.setattr(
+        "quant_trade.backtest.report._make_charts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("chart failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="chart failed"):
+        save_backtest_report(
+            name="example",
+            result=result,
+            out_dir=out_dir,
+            execution=ExecutionConfig(),
+        )
+
+    assert not out_dir.exists()
+    assert not list(tmp_path.glob(".*.staging-*"))

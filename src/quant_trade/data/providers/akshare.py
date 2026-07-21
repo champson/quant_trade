@@ -22,6 +22,7 @@ class AkShareProvider(DataProvider):
         return (
             super().supports(request)
             and request.frequency == Frequency.DAY
+            and bool(request.symbols)
             and request.asset_type in {AssetType.STOCK, AssetType.ETF, AssetType.INDEX}
             and not (
                 request.asset_type == AssetType.INDEX and request.adjustment != Adjustment.NONE

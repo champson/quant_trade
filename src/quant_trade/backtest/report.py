@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import html
 import json
+import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -175,7 +177,7 @@ def _image_data(path: Path) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def save_backtest_report(
+def _write_backtest_report(
     *,
     name: str,
     result: BacktestResult,
@@ -184,6 +186,7 @@ def save_backtest_report(
     strategy_config: dict[str, Any] | None = None,
     benchmark_equity: pd.Series | None = None,
     benchmark_name: str | None = None,
+    benchmark_status: str = "未配置",
 ) -> BacktestReportPaths:
     """Write raw results plus human-readable Markdown and self-contained HTML."""
     if result.equity.empty:
@@ -193,6 +196,11 @@ def save_backtest_report(
     if benchmark_equity is not None:
         benchmark_equity = benchmark_equity.dropna().sort_index()
         benchmark_equity.index = pd.to_datetime(benchmark_equity.index)
+        if not benchmark_equity.empty and benchmark_status == "未配置":
+            benchmark_status = (
+                f"完整覆盖 {benchmark_equity.index.min().date()} "
+                f"至 {benchmark_equity.index.max().date()}"
+            )
 
     equity_path = out_dir / "equity.csv"
     positions_path = out_dir / "positions.csv"
@@ -213,6 +221,15 @@ def save_backtest_report(
         "strategy": result.metrics,
         "benchmark": benchmark_metrics,
         "benchmark_name": benchmark_name,
+        "benchmark_status": benchmark_status,
+        "benchmark_period": (
+            {
+                "start": str(benchmark_equity.index.min().date()),
+                "end": str(benchmark_equity.index.max().date()),
+            }
+            if benchmark_equity is not None and not benchmark_equity.empty
+            else None
+        ),
     }
     metrics_path.write_text(
         json.dumps(_json_safe(metrics_payload), ensure_ascii=False, indent=2, default=str),
@@ -267,7 +284,7 @@ def save_backtest_report(
         ["手续费、印花税、滑点", "已建模"],
         ["涨跌停、停牌", "未建模"],
         ["T+1", "未建模"],
-        ["整数股 / 100股一手", "由 lot_size 配置；默认未启用100股约束"],
+        ["整数手", f"已建模：每笔成交按 lot_size={execution.lot_size} 向下取整"],
         ["财务公告时点", "由策略输入数据负责；引擎未独立校验"],
         ["退市与生存者偏差", "取决于股票池数据；引擎未独立校验"],
     ]
@@ -289,9 +306,11 @@ def save_backtest_report(
 | 初始资金 | {execution.initial_cash:,.2f} |
 | 期末权益 | {result.equity.iloc[-1]:,.2f} |
 | 比较基准 | {benchmark_label} |
+| 基准数据状态 | {benchmark_status} |
 | 佣金率 | {execution.commission_rate:.4%} |
 | 卖出印花税率 | {execution.stamp_duty_rate:.4%} |
 | 滑点率 | {execution.slippage_rate:.4%} |
+| 每手数量 | {execution.lot_size} |
 
 策略配置：
 
@@ -362,7 +381,7 @@ img{{display:block;width:100%;height:auto;margin:18px 0}} pre{{background:#f5f7f
 <h1>{html.escape(name)} 回测报告</h1><div class="muted">{start.date()} 至 {end.date()} · 自动生成于 {html.escape(generated_at)}</div>
 <div class="cards">{summary_cards}</div>
 <h2>策略与回测设置</h2>
-{_html_table(["项目", "内容"], [["初始资金", f"{execution.initial_cash:,.2f}"], ["期末权益", f"{result.equity.iloc[-1]:,.2f}"], ["比较基准", benchmark_label], ["佣金 / 印花税 / 滑点", f"{execution.commission_rate:.4%} / {execution.stamp_duty_rate:.4%} / {execution.slippage_rate:.4%}"]])}
+{_html_table(["项目", "内容"], [["初始资金", f"{execution.initial_cash:,.2f}"], ["期末权益", f"{result.equity.iloc[-1]:,.2f}"], ["比较基准", benchmark_label], ["基准数据状态", benchmark_status], ["佣金 / 印花税 / 滑点", f"{execution.commission_rate:.4%} / {execution.stamp_duty_rate:.4%} / {execution.slippage_rate:.4%}"], ["每手数量", str(execution.lot_size)]])}
 <details><summary>策略配置</summary><pre>{html.escape(config_text)}</pre></details>
 <h2>净值与回撤</h2><img alt="净值与回撤" src="{_image_data(equity_chart)}">
 <h2>核心绩效</h2>{_html_table(["指标", "策略", "基准"], metric_rows)}
@@ -383,4 +402,40 @@ img{{display:block;width:100%;height:auto;margin:18px 0}} pre{{background:#f5f7f
         positions=positions_path,
         trades=trades_path,
         metrics=metrics_path,
+    )
+
+
+def save_backtest_report(
+    *,
+    name: str,
+    result: BacktestResult,
+    out_dir: Path,
+    execution: ExecutionConfig,
+    strategy_config: dict[str, Any] | None = None,
+    benchmark_equity: pd.Series | None = None,
+    benchmark_name: str | None = None,
+    benchmark_status: str = "未配置",
+) -> BacktestReportPaths:
+    """Atomically publish a complete versioned report directory."""
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = out_dir.parent / f".{out_dir.name}.staging-{uuid.uuid4().hex}"
+    try:
+        staged = _write_backtest_report(
+            name=name,
+            result=result,
+            out_dir=staging,
+            execution=execution,
+            strategy_config=strategy_config,
+            benchmark_equity=benchmark_equity,
+            benchmark_name=benchmark_name,
+            benchmark_status=benchmark_status,
+        )
+        if out_dir.exists():
+            raise FileExistsError(f"回测运行目录已存在: {out_dir}")
+        staging.replace(out_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return BacktestReportPaths(
+        **{field: out_dir / path.name for field, path in staged.as_dict().items()}
     )

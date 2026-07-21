@@ -15,7 +15,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from quant_trade.config import AppConfig
-from quant_trade.data.minute_archive import MinuteArchiveImporter
+from quant_trade.data.minute_archive import (
+    MinuteArchiveImporter,
+    apply_timestamp_convention,
+    minute_placeholder_mask,
+    validate_minute_time_grid,
+)
 from quant_trade.data.quality import DataQualityError, validate_bars
 from quant_trade.data.storage import DataStore
 
@@ -127,10 +132,22 @@ class MinuteDirectoryImporter:
         for row in frame.to_dict("records"):
             category = row["category"].strip().lower()
             rows = int(row["rows"]) if row.get("rows", "").strip().isdigit() else None
+            relative_file = row["relative_file"].strip()
+            if not relative_file or Path(relative_file).is_absolute():
+                raise DataQualityError(
+                    f"manifest.csv relative_file 必须是目录内相对路径: {relative_file!r}"
+                )
+            path = (root / relative_file).resolve()
+            try:
+                relative_path = path.relative_to(root.resolve())
+            except ValueError as exc:
+                raise DataQualityError(
+                    f"manifest.csv relative_file 不得越过导入目录: {relative_file}"
+                ) from exc
             sources.append(
                 DirectorySource(
-                    path=root / row["relative_file"],
-                    relative_path=row["relative_file"],
+                    path=path,
+                    relative_path=str(relative_path),
                     symbol=self._normalize_symbol(row["ts_code"]),
                     asset_type=ASSET_TYPES.get(category, category),
                     expected_rows=rows,
@@ -151,12 +168,15 @@ class MinuteDirectoryImporter:
                 continue
             relative = path.relative_to(root)
             category = relative.parts[0].lower() if len(relative.parts) > 1 else ""
+            symbol = self._filename_symbol(path)
             discovered.append(
                 DirectorySource(
                     path=path,
                     relative_path=str(relative),
-                    symbol=self._filename_symbol(path),
-                    asset_type=ASSET_TYPES.get(category, "unknown"),
+                    symbol=symbol,
+                    asset_type=ASSET_TYPES.get(
+                        category, MinuteArchiveImporter._asset_type(symbol, "auto")
+                    ),
                 )
             )
         if not discovered:
@@ -231,28 +251,11 @@ class MinuteDirectoryImporter:
 
     @staticmethod
     def _placeholder_mask(frame: pd.DataFrame, asset_type: str) -> pd.Series:
-        if asset_type != "etf":
-            return pd.Series(False, index=frame.index)
-        clock = frame["bar_time"].dt.strftime("%H:%M:%S").eq("09:31:00")
-        one_price = frame[["open", "high", "low", "close"]].eq(1.0).all(axis=1)
-        zero_trade = frame["volume"].eq(0) & frame["amount"].fillna(0).eq(0)
-        return clock & one_price & zero_trade
+        return minute_placeholder_mask(frame.assign(asset_type=asset_type))
 
     @staticmethod
     def _validate_time_grid(frame: pd.DataFrame, frequency: str, asset_type: str) -> None:
-        minutes = int(frequency.removesuffix("min"))
-        timestamps = frame["bar_time"]
-        clock_minutes = timestamps.dt.hour * 60 + timestamps.dt.minute
-        auction = asset_type == "stock" and clock_minutes.eq(9 * 60 + 30)
-        am_elapsed = clock_minutes - (9 * 60 + 30)
-        pm_elapsed = clock_minutes - (13 * 60)
-        regular = ((am_elapsed > 0) & (am_elapsed <= 120) & am_elapsed.mod(minutes).eq(0)) | (
-            (pm_elapsed >= 0) & (pm_elapsed <= 120) & pm_elapsed.mod(minutes).eq(0)
-        )
-        invalid = ~(regular | auction)
-        if invalid.any():
-            examples = frame.loc[invalid, "bar_time"].head(3).astype(str).tolist()
-            raise DataQualityError(f"存在不符合{frequency}交易时段的时间: {examples}")
+        validate_minute_time_grid(frame, frequency, asset_type)
 
     @staticmethod
     def _deduplicate(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -285,6 +288,9 @@ class MinuteDirectoryImporter:
                 f"{frame.loc[mismatched, 'symbol'].iloc[0]}"
             )
         frame["bar_time"] = pd.to_datetime(frame["bar_time"], errors="coerce")
+        frame["bar_time"] = apply_timestamp_convention(
+            frame["bar_time"], frequency, self.config.minute.timestamp_convention
+        )
         for column in NUMERIC_COLUMNS:
             if column not in frame:
                 frame[column] = pd.NA
@@ -379,6 +385,7 @@ class MinuteDirectoryImporter:
         statistics: dict[int, dict[str, Any]] = {}
         previous_time: pd.Timestamp | None = None
         previous_values: tuple[Any, ...] | None = None
+        source_recorded = False
         try:
             encoding, mapping = self._encoding_and_mapping(source.path)
             if not mapping:
@@ -465,6 +472,22 @@ class MinuteDirectoryImporter:
                     writer.close()
                 writers.clear()
                 if staged:
+                    source_record = {
+                        "source_path": source_path,
+                        "frequency": frequency,
+                        "symbol": source.symbol,
+                        "asset_type": source.asset_type,
+                        "file_hash": file_hash,
+                        "file_size": stat.st_size,
+                        "file_mtime_ns": stat.st_mtime_ns,
+                        "rows_input": result.rows_input,
+                        "rows_written": result.rows_written,
+                        "rows_filtered": result.rows_filtered,
+                        "min_time": result.min_time,
+                        "max_time": result.max_time,
+                        "status": "success",
+                        "statistics": statistics,
+                    }
                     self.store.commit_minute_symbol(
                         frequency=frequency,
                         symbol=source.symbol,
@@ -472,29 +495,33 @@ class MinuteDirectoryImporter:
                         staged=staged,
                         statistics=statistics,
                         source_hash=file_hash,
+                        source_record=source_record,
                     )
                     result.status = "success"
+                    source_recorded = True
                 else:
                     # An empty/truncated source is not proof that previously
                     # imported history should be deleted.
                     result.status = "empty"
-            self.store.record_minute_source(
-                {
-                    "source_path": source_path,
-                    "frequency": frequency,
-                    "symbol": source.symbol,
-                    "asset_type": source.asset_type,
-                    "file_hash": file_hash,
-                    "file_size": stat.st_size,
-                    "file_mtime_ns": stat.st_mtime_ns,
-                    "rows_input": result.rows_input,
-                    "rows_written": result.rows_written,
-                    "rows_filtered": result.rows_filtered,
-                    "min_time": result.min_time,
-                    "max_time": result.max_time,
-                    "status": result.status,
-                }
-            )
+            if not source_recorded:
+                self.store.record_minute_source(
+                    {
+                        "source_path": source_path,
+                        "frequency": frequency,
+                        "symbol": source.symbol,
+                        "asset_type": source.asset_type,
+                        "file_hash": file_hash,
+                        "file_size": stat.st_size,
+                        "file_mtime_ns": stat.st_mtime_ns,
+                        "rows_input": result.rows_input,
+                        "rows_written": result.rows_written,
+                        "rows_filtered": result.rows_filtered,
+                        "min_time": result.min_time,
+                        "max_time": result.max_time,
+                        "status": result.status,
+                        "members": [],
+                    }
+                )
             return result
         except Exception as exc:
             result.error = str(exc)
@@ -514,6 +541,7 @@ class MinuteDirectoryImporter:
                     "rows_filtered": result.rows_filtered,
                     "status": "failed",
                     "error": result.error,
+                    "members": [],
                 }
             )
             return result
@@ -537,32 +565,52 @@ class MinuteDirectoryImporter:
         run_id = f"minute-{uuid.uuid4().hex[:12]}"
         result = DirectoryImportResult(run_id, profile.root, frequency, len(sources))
         self.store.start_minute_import_run(run_id, profile.root, frequency, len(sources))
-        for index, source in enumerate(sources, 1):
-            item = self._import_file(source, frequency, run_id, resume)
-            if item.status == "success":
-                result.files_success += 1
-            elif item.status == "skipped":
-                result.files_skipped += 1
-            elif item.status == "empty":
-                result.files_empty += 1
-            else:
-                result.files_failed += 1
-                result.failures.append({"file": item.relative_path, "error": item.error or ""})
-            result.rows_written += item.rows_written
-            result.rows_filtered += item.rows_filtered
-            if progress:
-                progress(index, len(sources), item)
-        self.store.finish_minute_import_run(
-            run_id,
-            {
-                "status": result.status,
-                "files_success": result.files_success,
-                "files_skipped": result.files_skipped,
-                "files_empty": result.files_empty,
-                "files_failed": result.files_failed,
-                "rows_written": result.rows_written,
-                "rows_filtered": result.rows_filtered,
-                "details": {"failures": result.failures[:100]},
-            },
-        )
+        run_error: BaseException | None = None
+        try:
+            for index, source in enumerate(sources, 1):
+                try:
+                    item = self._import_file(source, frequency, run_id, resume)
+                except Exception as exc:
+                    # File metadata/hash failures happen before _import_file's own
+                    # staging guard. Keep the batch auditable and continue others.
+                    item = FileImportResult(
+                        source.relative_path,
+                        source.symbol,
+                        source.asset_type,
+                        "failed",
+                        error=str(exc),
+                    )
+                if item.status == "success":
+                    result.files_success += 1
+                elif item.status == "skipped":
+                    result.files_skipped += 1
+                elif item.status == "empty":
+                    result.files_empty += 1
+                else:
+                    result.files_failed += 1
+                    result.failures.append({"file": item.relative_path, "error": item.error or ""})
+                result.rows_written += item.rows_written
+                result.rows_filtered += item.rows_filtered
+                if progress:
+                    progress(index, len(sources), item)
+        except BaseException as exc:
+            run_error = exc
+            raise
+        finally:
+            details: dict[str, Any] = {"failures": result.failures[:100]}
+            if run_error is not None:
+                details["run_error"] = str(run_error)
+            self.store.finish_minute_import_run(
+                run_id,
+                {
+                    "status": "failed" if run_error is not None else result.status,
+                    "files_success": result.files_success,
+                    "files_skipped": result.files_skipped,
+                    "files_empty": result.files_empty,
+                    "files_failed": result.files_failed,
+                    "rows_written": result.rows_written,
+                    "rows_filtered": result.rows_filtered,
+                    "details": details,
+                },
+            )
         return result

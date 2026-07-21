@@ -5,6 +5,7 @@ import pytest
 
 from quant_trade.backtest.engine import ExecutionConfig, run_weight_backtest
 from quant_trade.strategies.etf_rotation import EtfRotationStrategy, _rebalance_periods
+from quant_trade.strategies.logbias import LogBiasStrategy
 from quant_trade.strategies.microcap import MicrocapStrategy
 
 
@@ -158,6 +159,53 @@ def test_etf_rebalance_periods_do_not_shift_with_window_start():
     full = _rebalance_periods(dates, 5, "2000-01-03")
     sliced = _rebalance_periods(dates[7:], 5, "2000-01-03")
     assert sliced.tolist() == full[7:].tolist()
+
+
+def test_etf_weekly_period_treats_holiday_week_as_one_period():
+    dates = pd.to_datetime(["2024-09-30", "2024-10-08", "2024-10-09", "2024-10-10"])
+    periods = _rebalance_periods(dates, 5, "2000-01-03")
+    assert periods[1] == periods[2] == periods[3]
+    assert periods[0] != periods[1]
+
+
+def test_logbias_missing_observation_preserves_existing_holding_state(monkeypatch):
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    bars = _bars(("A", "B"), periods=4)
+    bars = bars[~((bars["symbol"] == "A") & (bars["trade_date"] == dates[2]))]
+    strategy = LogBiasStrategy({"entry": 0.0, "stop": -5.0, "overheat": 10.0})
+
+    def indicator(prices):
+        return pd.DataFrame(
+            {
+                "A": [1.0, 1.0, float("nan"), 1.0],
+                "B": [-10.0] * 4,
+            },
+            index=prices.index,
+        )
+
+    monkeypatch.setattr(strategy, "_indicator", indicator)
+    targets = strategy.generate_targets(bars)
+
+    assert targets.loc[dates[2], "A"] == 1.0
+    assert targets.loc[dates[3], "A"] == 1.0
+
+
+def test_affordability_never_breaks_round_lot_constraint():
+    bars = _bars(periods=3)
+    dates = sorted(bars["trade_date"].unique())
+    targets = pd.DataFrame({"A": [1.0]}, index=[dates[0]])
+    result = run_weight_backtest(
+        bars,
+        targets,
+        ExecutionConfig(
+            initial_cash=2500,
+            commission_rate=0.01,
+            stamp_duty_rate=0,
+            slippage_rate=0,
+            lot_size=100,
+        ),
+    )
+    assert result.trades.iloc[0]["quantity"] == 200
 
 
 def test_microcap_selection_uses_previous_day_market_cap():

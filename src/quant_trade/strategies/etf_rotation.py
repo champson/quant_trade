@@ -1,15 +1,27 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from quant_trade.strategies.base import SignalResult, Strategy, StrategyMetadata
 
 
-def _rebalance_periods(index: pd.DatetimeIndex, rebalance_days: int, anchor: str) -> np.ndarray:
-    anchor_day = np.datetime64(pd.Timestamp(anchor).date(), "D")
-    dates = index.to_numpy(dtype="datetime64[D]")
-    return np.busday_count(anchor_day, dates) // rebalance_days
+def _rebalance_periods(
+    index: pd.DatetimeIndex, rebalance_days: int, anchor: str | None = None
+) -> pd.Index:
+    """Return date-anchored periods without pretending exchange holidays are open."""
+    # ``anchor`` remains accepted for compatibility with older research code;
+    # calendar week/month labels are already globally stable.
+    dates = pd.DatetimeIndex(index).normalize()
+    if rebalance_days == 1:
+        return pd.Index(dates.asi8, dtype="int64")
+    if rebalance_days == 5:
+        return pd.Index(dates.to_period("W-FRI").asi8, dtype="int64")
+    if rebalance_days in {20, 21, 22, 23}:
+        return pd.Index(dates.to_period("M").asi8, dtype="int64")
+    raise ValueError(
+        "rebalance_days 仅支持 1（日）、5（周）或 20-23（月）；"
+        "任意工作日计数无法正确处理交易所节假日"
+    )
 
 
 class EtfRotationStrategy(Strategy):
@@ -27,11 +39,7 @@ class EtfRotationStrategy(Strategy):
         prices, scores, eligible = self._matrices(bars)
         hold_num = max(1, int(self.config.get("hold_num", 1)))
         rebalance_days = max(1, int(self.config.get("rebalance_days", 5)))
-        periods = _rebalance_periods(
-            prices.index,
-            rebalance_days,
-            str(self.config.get("rebalance_anchor", "2000-01-03")),
-        )
+        periods = _rebalance_periods(prices.index, rebalance_days)
         targets = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
         current = pd.Series(0.0, index=prices.columns)
         previous_period: int | None = None

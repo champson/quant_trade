@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
+import uuid
 from pathlib import Path
-import warnings
 
 import pandas as pd
 
 from quant_trade.reports.market_review import MarketReview
+
+
+CHINESE_FONT_CANDIDATES = (
+    "Hiragino Sans GB",
+    "PingFang SC",
+    "Heiti SC",
+    "Arial Unicode MS",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
+    "Source Han Sans SC",
+    "Microsoft YaHei",
+    "SimHei",
+    "WenQuanYi Micro Hei",
+)
+
+
+def _chinese_font_properties():
+    from matplotlib import font_manager
+
+    installed = {font.name: font.fname for font in font_manager.fontManager.ttflist}
+    for name in CHINESE_FONT_CANDIDATES:
+        if path := installed.get(name):
+            return font_manager.FontProperties(fname=path)
+    return font_manager.FontProperties()
 
 
 def save_market_review(
@@ -22,31 +49,15 @@ def save_market_review(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    chinese_font = _chinese_font_properties()
+    matplotlib.rcParams["axes.unicode_minus"] = False
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = review.as_of.strftime("%Y-%m-%d")
-    csv_path = out_dir / f"market_breadth_{stamp}.csv"
-    png_path = out_dir / f"market_breadth_{stamp}.png"
-    summary_path = out_dir / f"market_summary_{stamp}.json"
-    review.breadth.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    pd.Series(review.summary).to_json(summary_path, force_ascii=False, indent=2)
-    fig, ax = plt.subplots(figsize=(10, 4.8))
-    ax.axis("off")
-    table = ax.table(
-        cellText=review.breadth.values,
-        colLabels=review.breadth.columns,
-        loc="center",
-        cellLoc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.5)
-    ax.set_title(f"A股市场宽度 {stamp}")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Glyph .* missing from font")
-        fig.tight_layout()
-        fig.savefig(png_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    outputs = {"csv": csv_path, "png": png_path, "summary": summary_path}
+    names = {
+        "csv": f"market_breadth_{stamp}.csv",
+        "png": f"market_breadth_{stamp}.png",
+        "summary": f"market_summary_{stamp}.json",
+    }
     extras = {
         "indices": index_returns,
         "portfolio": portfolio,
@@ -55,7 +66,59 @@ def save_market_review(
     }
     for name, value in extras.items():
         if value is not None and not value.empty:
-            path = out_dir / f"{name}_{stamp}.csv"
-            value.to_csv(path, encoding="utf-8-sig")
-            outputs[name] = path
-    return outputs
+            names[name] = f"{name}_{stamp}.csv"
+
+    staging = out_dir / ".staging" / uuid.uuid4().hex
+    staging.mkdir(parents=True, exist_ok=False)
+    manifest_name = f"review_manifest_{stamp}.json"
+    try:
+        review.breadth.to_csv(staging / names["csv"], index=False, encoding="utf-8-sig")
+        pd.Series(review.summary).to_json(staging / names["summary"], force_ascii=False, indent=2)
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        try:
+            ax.axis("off")
+            table = ax.table(
+                cellText=review.breadth.values,
+                colLabels=review.breadth.columns,
+                loc="center",
+                cellLoc="center",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 1.5)
+            for cell in table.get_celld().values():
+                cell.get_text().set_fontproperties(chinese_font)
+            ax.set_title(f"A股市场宽度 {stamp}", fontproperties=chinese_font)
+            fig.tight_layout()
+            fig.savefig(staging / names["png"], dpi=150, bbox_inches="tight")
+        finally:
+            plt.close(fig)
+        for name, value in extras.items():
+            if name in names:
+                value.to_csv(staging / names[name], encoding="utf-8-sig")
+
+        checksums = {
+            name: hashlib.sha256((staging / filename).read_bytes()).hexdigest()
+            for name, filename in names.items()
+        }
+        manifest = {
+            "as_of": stamp,
+            "files": names,
+            "sha256": checksums,
+        }
+        (staging / manifest_name).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # A manifest is published last, so readers never select a partially
+        # rendered generation. Individual replacements are atomic on one volume.
+        for name in names.values():
+            (staging / name).replace(out_dir / name)
+        for name in extras:
+            if name not in names:
+                (out_dir / f"{name}_{stamp}.csv").unlink(missing_ok=True)
+        (staging / manifest_name).replace(out_dir / manifest_name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return {name: out_dir / filename for name, filename in names.items()}

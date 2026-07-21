@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pandas as pd
+
 from quant_trade.config import AppConfig
 from quant_trade.data.base import (
     DataProvider,
@@ -27,6 +29,29 @@ class DataRouter:
         self.store = store
         retry = config.providers.retry
         self.circuit = CircuitBreaker(retry.circuit_failures, retry.circuit_cooldown_seconds)
+
+    @staticmethod
+    def _validate_provider_result(
+        request: DataRequest, batch: DataBatch, provider_name: str
+    ) -> DataBatch:
+        if batch.data is None or batch.data.empty:
+            raise EmptyDataError(f"{provider_name} 返回空数据")
+        if request.dataset != Dataset.TRADE_CALENDAR:
+            return batch
+        if "cal_date" in batch.data:
+            date_column = "cal_date"
+        elif "calendar_date" in batch.data:
+            date_column = "calendar_date"
+        else:
+            raise PermanentProviderError(f"{provider_name} 交易日历缺少日期字段")
+        actual = set(pd.to_datetime(batch.data[date_column], errors="coerce").dropna().dt.date)
+        expected = set(pd.date_range(request.start, request.end, freq="D").date)
+        missing = sorted(expected - actual)
+        if missing:
+            raise PermanentProviderError(
+                f"{provider_name} 交易日历区间不完整，缺少 {len(missing)} 天，例如 {missing[:3]}"
+            )
+        return batch
 
     def _candidates(self, request: DataRequest) -> list[str]:
         if request.provider != "auto":
@@ -54,7 +79,11 @@ class DataRouter:
                 continue
             try:
                 batch = retry_call(
-                    lambda: provider.fetch(replace(request, provider=name)),
+                    lambda: self._validate_provider_result(
+                        request,
+                        provider.fetch(replace(request, provider=name)),
+                        name,
+                    ),
                     self.config.providers.retry,
                 )
                 if request.dataset == Dataset.BARS:

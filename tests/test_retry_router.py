@@ -231,3 +231,85 @@ def test_circuit_open_plus_empty_is_not_confirmed_empty(app_config):
                 end=date(2024, 1, 2),
             )
         )
+
+
+def test_partial_trade_calendar_falls_back_to_next_provider(app_config):
+    class CalendarProvider(DataProvider):
+        def __init__(self, name, dates, date_column="cal_date"):
+            self.name = name
+            self.dates = dates
+            self.date_column = date_column
+
+        def capabilities(self):
+            return {Dataset.TRADE_CALENDAR}
+
+        def fetch(self, request):
+            return DataBatch(
+                pd.DataFrame(
+                    {
+                        self.date_column: [
+                            pd.Timestamp(day).strftime("%Y%m%d") for day in self.dates
+                        ],
+                        "is_open": [1] * len(self.dates),
+                    }
+                ),
+                self.name,
+                request,
+            )
+
+    app_config.providers.priority = ["partial", "complete"]
+    app_config.providers.retry.attempts = 1
+    router = DataRouter(
+        app_config,
+        {
+            "partial": CalendarProvider("partial", ["2024-01-01", "2024-01-03"]),
+            "complete": CalendarProvider(
+                "complete",
+                ["2024-01-01", "2024-01-02", "2024-01-03"],
+                "calendar_date",
+            ),
+        },
+    )
+    batch = router.fetch(
+        DataRequest(
+            dataset=Dataset.TRADE_CALENDAR,
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 3),
+        )
+    )
+    assert batch.provider == "complete"
+    assert any("日历区间不完整" in warning for warning in batch.warnings)
+
+
+def test_partial_trade_calendar_is_not_retried(app_config):
+    class FlakyCalendar(DataProvider):
+        name = "flaky"
+
+        def __init__(self):
+            self.calls = 0
+
+        def capabilities(self):
+            return {Dataset.TRADE_CALENDAR}
+
+        def fetch(self, request):
+            self.calls += 1
+            days = ["20240101"] if self.calls == 1 else ["20240101", "20240102"]
+            return DataBatch(
+                pd.DataFrame({"cal_date": days, "is_open": [1] * len(days)}),
+                self.name,
+                request,
+            )
+
+    app_config.providers.priority = ["flaky"]
+    app_config.providers.retry.attempts = 2
+    app_config.providers.retry.delays = [0, 0]
+    provider = FlakyCalendar()
+    with pytest.raises(ProviderError, match="交易日历区间不完整"):
+        DataRouter(app_config, {provider.name: provider}).fetch(
+            DataRequest(
+                dataset=Dataset.TRADE_CALENDAR,
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 2),
+            )
+        )
+    assert provider.calls == 1
