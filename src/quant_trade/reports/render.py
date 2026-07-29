@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant_trade.reports.market_review import MarketReview
+from quant_trade.reports.market_review import MarketReview, build_daily_review_table
 
 
 CHINESE_FONT_CANDIDATES = (
@@ -40,8 +40,11 @@ def save_market_review(
     out_dir: Path,
     *,
     index_returns: pd.DataFrame | None = None,
+    index_bias: pd.Series | None = None,
     portfolio: pd.Series | None = None,
     convertible_summary: pd.DataFrame | None = None,
+    underlying_summary: pd.DataFrame | None = None,
+    microcap_returns: pd.Series | None = None,
     bias: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     import matplotlib
@@ -57,6 +60,7 @@ def save_market_review(
         "csv": f"market_breadth_{stamp}.csv",
         "png": f"market_breadth_{stamp}.png",
         "summary": f"market_summary_{stamp}.json",
+        "daily_review": f"daily_review_{stamp}.csv",
     }
     extras = {
         "indices": index_returns,
@@ -72,7 +76,17 @@ def save_market_review(
     staging.mkdir(parents=True, exist_ok=False)
     manifest_name = f"review_manifest_{stamp}.json"
     try:
+        daily_review = build_daily_review_table(
+            review,
+            index_returns=index_returns,
+            index_bias=index_bias,
+            convertible_summary=convertible_summary,
+            underlying_summary=underlying_summary,
+            microcap_returns=microcap_returns,
+            portfolio_returns=portfolio,
+        )
         review.breadth.to_csv(staging / names["csv"], index=False, encoding="utf-8-sig")
+        daily_review.to_csv(staging / names["daily_review"], index=False, encoding="utf-8-sig")
         pd.Series(review.summary).to_json(staging / names["summary"], force_ascii=False, indent=2)
         fig, ax = plt.subplots(figsize=(10, 4.8))
         try:

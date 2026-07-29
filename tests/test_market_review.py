@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from quant_trade.reports.market_review import build_market_review, portfolio_returns
+from quant_trade.reports.market_review import (
+    build_daily_review_table,
+    build_market_review,
+    nav_period_returns,
+    portfolio_returns,
+    price_bias,
+)
 from quant_trade.reports.render import _chinese_font_properties, save_market_review
 
 
@@ -22,13 +28,13 @@ def test_market_review_counts_all_symbols():
     assert report.summary["up"] == 1
     assert report.summary["down"] == 1
     assert report.breadth["当天"].sum() == 3
-    flat = report.breadth.set_index("区间").loc["平盘", "当天"]
+    flat = report.breadth.set_index("区间").loc["涨幅>-5%到0%", "当天"]
     assert flat == 1
 
 
-def test_market_review_exact_negative_thresholds_are_symmetric():
+def test_market_review_uses_requested_exhaustive_return_buckets():
     dates = pd.to_datetime(["2023-12-29", "2024-01-05", "2024-01-08"])
-    returns = [-0.07, -0.05, -0.03, 0.03, 0.05, 0.07]
+    returns = [-0.10, -0.05, 0.0, 0.05, 0.10, 0.11]
     rows = []
     for index, value in enumerate(returns):
         rows.extend(
@@ -39,12 +45,64 @@ def test_market_review_exact_negative_thresholds_are_symmetric():
             ]
         )
     breadth = build_market_review(pd.DataFrame(rows), "2024-01-08").breadth.set_index("区间")
-    assert breadth.loc["下跌5%-7%", "当天"] == 1
-    assert breadth.loc["下跌3%-5%", "当天"] == 1
-    assert breadth.loc["下跌0%-3%", "当天"] == 1
-    assert breadth.loc["上涨0%-3%", "当天"] == 1
-    assert breadth.loc["上涨3%-5%", "当天"] == 1
-    assert breadth.loc["上涨5%-7%", "当天"] == 1
+    assert list(breadth["当天"]) == [1, 1, 1, 1, 1, 1]
+
+
+def test_daily_review_table_contains_period_counts_percentages_and_bias25():
+    dates = pd.to_datetime(["2023-12-29", "2024-01-05", "2024-01-08"])
+    rows = []
+    for symbol, prices in {"A": [10, 11, 12], "B": [10, 9, 8], "C": [10, 10, 10]}.items():
+        rows.extend(
+            {"trade_date": day, "symbol": symbol, "close": price}
+            for day, price in zip(dates, prices, strict=True)
+        )
+    review = build_market_review(pd.DataFrame(rows), "2024-01-08")
+    indices = pd.DataFrame(
+        {"今年": [0.1], "本月": [0.1], "本周": [0.02], "当天": [0.01]},
+        index=["上证指数"],
+    )
+    table = build_daily_review_table(
+        review,
+        index_returns=indices,
+        index_bias=pd.Series({"上证指数": 0.0123}),
+    ).set_index("名称")
+
+    assert list(table.columns) == ["今年", "本月", "本周", "当天", "BIAS25"]
+    assert table.loc["A股总数量", "当天"] == "3"
+    assert table.loc["A股上涨比例", "当天"] == "33.33%"
+    assert table.loc["涨幅>-5%到0%", "当天"] == "33.33%"
+    assert table.loc["上证指数", "今年"] == "10.00%"
+    assert table.loc["上证指数", "BIAS25"] == "1.23%"
+    assert table.loc["我的实盘合计", "当天"] == ""
+
+
+def test_price_bias_uses_25_day_simple_moving_average():
+    prices = list(range(1, 26))
+    bars = pd.DataFrame(
+        {
+            "trade_date": pd.bdate_range("2024-01-01", periods=25),
+            "symbol": "000001.SH",
+            "close": prices,
+        }
+    )
+    result = price_bias(bars, window=25)
+    assert result["000001.SH"] == pytest.approx(25 / 13 - 1)
+
+
+def test_nav_period_returns_uses_market_review_anchors():
+    values = pd.Series(
+        [100, 105, 110],
+        index=pd.to_datetime(["2023-12-29", "2024-01-05", "2024-01-08"]),
+    )
+    anchors = {
+        "当天": pd.Timestamp("2024-01-05"),
+        "本周": pd.Timestamp("2023-12-29"),
+        "本月": pd.Timestamp("2023-12-29"),
+        "今年": pd.Timestamp("2023-12-29"),
+    }
+    result = nav_period_returns(values, anchors, "2024-01-08")
+    assert result["当天"] == pytest.approx(110 / 105 - 1)
+    assert result["今年"] == pytest.approx(0.1)
 
 
 def test_portfolio_review_rejects_missing_holding_prices():
@@ -100,6 +158,7 @@ def test_review_publish_removes_stale_optional_artifact_and_writes_manifest(tmp_
 
     first = save_market_review(review, tmp_path, convertible_summary=optional)
     assert first["convertible_bonds"].exists()
+    assert first["daily_review"].exists()
 
     second = save_market_review(review, tmp_path)
 

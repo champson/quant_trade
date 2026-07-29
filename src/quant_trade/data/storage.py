@@ -20,6 +20,9 @@ from quant_trade.data.quality import DataQualityError, validate_bars
 from quant_trade.models import Adjustment, AssetType
 
 
+_DAILY_BULK_WRITE_MIN_PARTITIONS = 32
+
+
 class DataStore:
     def __init__(self, config: AppConfig):
         self.config = config
@@ -155,6 +158,18 @@ class DataStore:
     def minute_write_lock(self):
         """Serialize minute recovery, merging and commits across processes."""
         lock_path = self.root / ".staging" / "minute-write.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def daily_write_lock(self):
+        """Serialize read-merge-replace cycles for daily symbol files."""
+        lock_path = self.root / ".staging" / "daily-write.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -590,19 +605,36 @@ class DataStore:
                     symbol: (file_size, file_mtime_ns)
                     for symbol, file_size, file_mtime_ns in fingerprints
                 }
-                con.executemany(
-                    "INSERT INTO market_snapshot_members VALUES (?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            asset,
-                            mode,
-                            day,
-                            symbol,
-                            fingerprint_by_symbol.get(symbol, (None, None))[0],
-                            fingerprint_by_symbol.get(symbol, (None, None))[1],
-                        )
-                        for symbol in member_symbols
-                    ],
+                members = pd.DataFrame(
+                    {
+                        "asset_type": asset,
+                        "adjustment": mode,
+                        "trade_date": day,
+                        "symbol": member_symbols,
+                        "file_size": pd.array(
+                            [
+                                fingerprint_by_symbol.get(symbol, (None, None))[0]
+                                for symbol in member_symbols
+                            ],
+                            dtype="Int64",
+                        ),
+                        "file_mtime_ns": pd.array(
+                            [
+                                fingerprint_by_symbol.get(symbol, (None, None))[1]
+                                for symbol in member_symbols
+                            ],
+                            dtype="Int64",
+                        ),
+                    }
+                )
+                con.register("new_market_snapshot_members", members)
+                con.execute(
+                    """
+                    INSERT INTO market_snapshot_members
+                    SELECT asset_type, adjustment, trade_date, symbol,
+                           file_size, file_mtime_ns
+                    FROM new_market_snapshot_members
+                    """
                 )
         return status == "complete"
 
@@ -991,10 +1023,60 @@ class DataStore:
         return df
 
     def write_daily(self, df: pd.DataFrame, asset_type: AssetType | str) -> int:
-        count = 0
         asset = AssetType(asset_type).value
-        fingerprints: list[tuple[int, int, str, str, str]] = []
         work = self._with_daily_metadata(df, asset_type)
+        groups = work[["symbol", "adjustment"]].dropna().drop_duplicates()
+        paths = [
+            self.daily_path(asset_type, str(row.symbol), str(row.adjustment))
+            for row in groups.itertuples(index=False)
+        ]
+        use_bulk = len(groups) >= _DAILY_BULK_WRITE_MIN_PARTITIONS and len(set(paths)) == len(paths)
+        with self.daily_write_lock():
+            if use_bulk:
+                count, fingerprints = self._write_daily_bulk_locked(work, asset, groups, paths)
+            else:
+                count, fingerprints = self._write_daily_sequential_locked(work, asset_type, asset)
+            if fingerprints:
+                self._refresh_daily_fingerprints(fingerprints)
+                self._snapshot_validation_cache.clear()
+        return count
+
+    def _refresh_daily_fingerprints(
+        self, fingerprints: list[tuple[int, int, str, str, str]]
+    ) -> None:
+        """Refresh snapshot member fingerprints with one catalog scan."""
+        if not fingerprints:
+            return
+        frame = pd.DataFrame(
+            fingerprints,
+            columns=["file_size", "file_mtime_ns", "asset_type", "adjustment", "symbol"],
+        )
+        with self.connect() as con:
+            con.register("refreshed_daily_files", frame)
+            con.execute(
+                """
+                UPDATE market_snapshot_members AS members
+                SET file_size = files.file_size,
+                    file_mtime_ns = files.file_mtime_ns
+                FROM refreshed_daily_files AS files
+                WHERE members.asset_type = files.asset_type
+                  AND members.adjustment = files.adjustment
+                  AND members.symbol = files.symbol
+                  AND (
+                    members.file_size IS DISTINCT FROM files.file_size
+                    OR members.file_mtime_ns IS DISTINCT FROM files.file_mtime_ns
+                  )
+                """
+            )
+
+    def _write_daily_sequential_locked(
+        self,
+        work: pd.DataFrame,
+        asset_type: AssetType | str,
+        asset: str,
+    ) -> tuple[int, list[tuple[int, int, str, str, str]]]:
+        count = 0
+        fingerprints: list[tuple[int, int, str, str, str]] = []
         for (symbol, adjustment), part in work.groupby(["symbol", "adjustment"], sort=False):
             path = self.daily_path(asset_type, str(symbol), str(adjustment))
             if path.exists():
@@ -1011,17 +1093,100 @@ class DataStore:
                 (stat.st_size, stat.st_mtime_ns, asset, str(adjustment), str(symbol))
             )
             count += len(part)
-        if fingerprints:
-            with self.connect() as con:
-                con.executemany(
-                    """
-                    UPDATE market_snapshot_members SET file_size = ?, file_mtime_ns = ?
-                    WHERE asset_type = ? AND adjustment = ? AND symbol = ?
-                    """,
-                    fingerprints,
+        return count, fingerprints
+
+    def _write_daily_bulk_locked(
+        self,
+        work: pd.DataFrame,
+        asset: str,
+        groups: pd.DataFrame,
+        paths: list[Path],
+    ) -> tuple[int, list[tuple[int, int, str, str, str]]]:
+        """Merge many symbol files in one streaming DuckDB partitioned write."""
+        write_id = uuid.uuid4().hex
+        source_column = f"__qt_{write_id}_source"
+        order_column = f"__qt_{write_id}_order"
+        rank_column = f"__qt_{write_id}_rank"
+        partition_column = f"__qt_{write_id}_partition"
+        incoming = work.copy()
+        incoming[source_column] = 1
+        incoming[order_column] = np.arange(len(incoming), dtype=np.int64)
+        partition_map = groups.copy().reset_index(drop=True)
+        partition_map[partition_column] = np.arange(len(partition_map), dtype=np.int64)
+        existing = [str(path) for path in paths if path.exists()]
+        staging_root = self.root / ".staging" / "daily-write" / write_id
+        output_root = staging_root / "partitions"
+        staging_root.mkdir(parents=True, exist_ok=False)
+        quoted_output = output_root.as_posix().replace("'", "''")
+        if existing:
+            combined = f"""
+                SELECT old.*, 0 AS \"{source_column}\",
+                       row_number() OVER () AS \"{order_column}\"
+                FROM read_parquet(?, hive_partitioning = false, union_by_name = true) old
+                UNION ALL BY NAME SELECT * FROM incoming_daily
+            """
+            parameters: list[Any] = [existing]
+        else:
+            combined = "SELECT * FROM incoming_daily"
+            parameters = []
+        query = f"""
+            COPY (
+                WITH combined AS ({combined}),
+                ranked AS (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY symbol, trade_date, adjustment
+                        ORDER BY \"{source_column}\" DESC, \"{order_column}\" DESC
+                    ) AS \"{rank_column}\"
+                    FROM combined
                 )
-            self._snapshot_validation_cache.clear()
-        return count
+                SELECT ranked.* EXCLUDE (
+                           \"{source_column}\", \"{order_column}\", \"{rank_column}\"
+                       ), partitions.\"{partition_column}\"
+                FROM ranked
+                JOIN daily_write_partitions partitions USING (symbol, adjustment)
+                WHERE \"{rank_column}\" = 1
+                ORDER BY partitions.\"{partition_column}\", trade_date
+            ) TO '{quoted_output}' (
+                FORMAT PARQUET,
+                COMPRESSION SNAPPY,
+                PARTITION_BY (\"{partition_column}\"),
+                FILENAME_PATTERN 'data'
+            )
+        """
+        fingerprints: list[tuple[int, int, str, str, str]] = []
+        try:
+            with duckdb.connect() as con:
+                # A single writer keeps every ordered partition in exactly one file.
+                con.execute("SET threads = 1")
+                con.register("incoming_daily", incoming)
+                con.register("daily_write_partitions", partition_map)
+                result = con.execute(query, parameters).fetchone()
+            count = int(result[0]) if result else 0
+            for partition_id, (row, path) in enumerate(
+                zip(partition_map.itertuples(index=False), paths, strict=True)
+            ):
+                staged_files = list(
+                    (output_root / f"{partition_column}={partition_id}").glob("*.parquet")
+                )
+                if len(staged_files) != 1:
+                    raise RuntimeError(
+                        f"日线批量写入分区 {partition_id} 生成了 {len(staged_files)} 个文件"
+                    )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                staged_files[0].replace(path)
+                stat = path.stat()
+                fingerprints.append(
+                    (
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        asset,
+                        str(row.adjustment),
+                        str(row.symbol),
+                    )
+                )
+            return count, fingerprints
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
 
     def replace_daily(self, df: pd.DataFrame, asset_type: AssetType | str) -> int:
         """Atomically replace each symbol/adjustment file represented by *df*."""
@@ -1031,25 +1196,19 @@ class DataStore:
         asset = AssetType(asset_type).value
         fingerprints: list[tuple[int, int, str, str, str]] = []
         work = self._with_daily_metadata(df, asset_type)
-        for (symbol, adjustment), part in work.groupby(["symbol", "adjustment"], sort=False):
-            part = part.sort_values("trade_date").drop_duplicates(
-                ["symbol", "trade_date", "adjustment"], keep="last"
-            )
-            path = self.daily_path(asset_type, str(symbol), str(adjustment))
-            self._atomic_parquet_write(part, path)
-            stat = path.stat()
-            fingerprints.append(
-                (stat.st_size, stat.st_mtime_ns, asset, str(adjustment), str(symbol))
-            )
-            count += len(part)
-        with self.connect() as con:
-            con.executemany(
-                """
-                UPDATE market_snapshot_members SET file_size = ?, file_mtime_ns = ?
-                WHERE asset_type = ? AND adjustment = ? AND symbol = ?
-                """,
-                fingerprints,
-            )
+        with self.daily_write_lock():
+            for (symbol, adjustment), part in work.groupby(["symbol", "adjustment"], sort=False):
+                part = part.sort_values("trade_date").drop_duplicates(
+                    ["symbol", "trade_date", "adjustment"], keep="last"
+                )
+                path = self.daily_path(asset_type, str(symbol), str(adjustment))
+                self._atomic_parquet_write(part, path)
+                stat = path.stat()
+                fingerprints.append(
+                    (stat.st_size, stat.st_mtime_ns, asset, str(adjustment), str(symbol))
+                )
+                count += len(part)
+            self._refresh_daily_fingerprints(fingerprints)
         self._snapshot_validation_cache.clear()
         return count
 

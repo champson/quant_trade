@@ -69,6 +69,13 @@ Parquet 丢失、缺少目标交易日或响应未达到阈值时不会命中断
 每日策略行情窗口按已启用策略的动量、均线、EMA 和 RPS 参数自动扩展；信号和回测都会
 校验实际取得的观测数量，不会用未充分预热的数据静默运行。每日复盘报告与全部策略信号
 先写入 staging，全部成功后由 `artifacts/daily/daily_manifest_<日期>.json` 整代发布。
+复盘同时生成 `artifacts/reviews/daily_review_<日期>.csv`，按“今年、本月、本周、当天、
+BIAS25”汇总 A 股数量/涨跌分布、均值与中位数、宽基指数、可转债、正股、微盘股和实盘。
+指数 BIAS25 使用收盘价相对最近 25 个交易日简单移动平均的偏离率。正股代码可通过
+`review.convertible_underlyings_file` 提供（支持 `正股代码`、`代码` 或 `symbol` 列）；
+微盘股和实盘的真实收益优先读取 `review.microcap_nav_file`、
+`review.portfolio_nav_file`，净值 CSV 需包含日期列 `trade_date/date/日期` 之一及数值列
+`nav/equity/净值/总资产` 之一。未配置的数据行留空，不使用替代数据冒充。
 
 每次回测会在 `artifacts/backtests/<策略名>/<运行编号>/` 同时生成自包含的
 `report.html`、可归档的 `report.md`、净值与月度图表，以及权益、持仓、成交和指标明细，

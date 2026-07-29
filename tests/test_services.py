@@ -263,6 +263,48 @@ def test_market_history_batches_daily_file_merges(app_config, monkeypatch):
     assert store.incomplete_market_snapshot_dates(AssetType.STOCK, days) == []
 
 
+def test_bulk_daily_write_merges_existing_files_and_refreshes_fingerprints(app_config):
+    store = DataStore(app_config)
+    symbols = [f"{index:06d}.SZ" for index in range(40)]
+    first_day = pd.Timestamp("2024-01-08")
+    second_day = pd.Timestamp("2024-01-09")
+    third_day = pd.Timestamp("2024-01-10")
+    initial = pd.concat(
+        [_rows(symbol, [first_day, second_day]) for symbol in symbols],
+        ignore_index=True,
+    )
+
+    assert store.write_daily(initial, AssetType.STOCK) == 80
+    for snapshot_day in (first_day, second_day):
+        assert store.mark_market_snapshot(
+            AssetType.STOCK,
+            snapshot_day,
+            row_count=len(symbols),
+            symbol_count=len(symbols),
+            expected_symbols=len(symbols),
+            symbols=symbols,
+            validation_sample_size=0,
+        )
+
+    updates = pd.concat(
+        [_rows(symbol, [second_day, third_day, third_day]) for symbol in symbols],
+        ignore_index=True,
+    )
+    updates["close"] = [99.0, 20.0, 21.0] * len(symbols)
+
+    assert store.write_daily(updates, AssetType.STOCK) == 120
+    saved = store.read_daily(symbols, None, None, asset_type=AssetType.STOCK, adjustment="none")
+    assert len(saved) == 120
+    assert not any(column.startswith("__qt_") for column in saved.columns)
+    by_day = saved.assign(day=pd.to_datetime(saved["trade_date"]).dt.date)
+    assert set(by_day.loc[by_day["day"] == second_day.date(), "close"]) == {99.0}
+    assert set(by_day.loc[by_day["day"] == third_day.date(), "close"]) == {21.0}
+    assert store.market_snapshot_complete(AssetType.STOCK, first_day)
+    assert store.market_snapshot_complete(AssetType.STOCK, second_day)
+    staging = store.root / ".staging" / "daily-write"
+    assert not staging.exists() or not any(staging.iterdir())
+
+
 def test_market_history_continues_and_flushes_after_provider_failure(app_config):
     app_config.providers.market_snapshot_min_symbols = {"stock": 1}
     days = [date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)]

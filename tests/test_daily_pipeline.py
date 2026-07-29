@@ -85,7 +85,7 @@ def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
     monkeypatch.setattr("quant_trade.pipelines.daily.notify", lambda *_: None)
     result = run_daily(app_config, router, store, date(2024, 1, 8))
     assert result.as_of == date(2024, 1, 8)
-    assert set(result.report_paths) >= {"csv", "png", "summary"}
+    assert set(result.report_paths) >= {"csv", "png", "summary", "daily_review"}
     assert all(pd.io.common.file_exists(path) for path in result.report_paths.values())
     assert (app_config.paths.artifacts_dir / "daily" / "daily_manifest_2024-01-08.json").exists()
     generation = _latest_daily_generation(app_config.paths.artifacts_dir)

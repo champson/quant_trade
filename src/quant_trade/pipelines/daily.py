@@ -20,11 +20,15 @@ from quant_trade.data.storage import DataStore
 from quant_trade.models import Adjustment, AssetType
 from quant_trade.notifications import notify
 from quant_trade.reports.market_review import (
+    MarketReview,
     asset_return_summary,
     build_market_review,
     logbias_table,
+    nav_period_returns,
+    normalize_stock_symbol,
     period_returns,
     portfolio_returns,
+    price_bias,
 )
 from quant_trade.reports.render import save_market_review
 from quant_trade.runs import RunTracker
@@ -102,6 +106,39 @@ def _anchors(days: list[date], as_of: date) -> list[date]:
         if eligible:
             result.append(eligible[-1])
     return sorted(set(result))
+
+
+def _read_review_nav(path: Path, review: MarketReview, name: str) -> pd.Series:
+    frame = pd.read_csv(path)
+    date_column = next(
+        (column for column in ("trade_date", "date", "日期") if column in frame),
+        None,
+    )
+    value_column = next(
+        (column for column in ("nav", "equity", "净值", "总资产") if column in frame),
+        None,
+    )
+    if date_column is None or value_column is None:
+        raise ValueError(f"{path} 必须包含 trade_date/date/日期 与 nav/equity/净值/总资产列")
+    values = pd.Series(
+        frame[value_column].to_numpy(),
+        index=pd.to_datetime(frame[date_column]),
+        name=name,
+    )
+    return nav_period_returns(values, review.anchor_dates, review.as_of)
+
+
+def _read_review_symbols(path: Path) -> list[str]:
+    frame = pd.read_csv(path, dtype=str).fillna("")
+    if frame.empty:
+        return []
+    column = next(
+        (name for name in ("正股代码", "代码", "symbol") if name in frame),
+        frame.columns[-1],
+    )
+    return sorted(
+        {normalize_stock_symbol(value) for value in frame[column].astype(str).str.strip() if value}
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -308,13 +345,24 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
             else pd.DataFrame()
         )
         index_ret = period_returns(index_bars, as_of) if not index_bars.empty else None
+        index_bias = price_bias(index_bars, as_of, 25) if not index_bars.empty else None
         if index_ret is not None:
             name_by_code = {v: k for k, v in (config.review.get("indices") or {}).items()}
-            index_ret = index_ret.rename(index=name_by_code)
+            index_names = list((config.review.get("indices") or {}).keys())
+            index_ret = index_ret.rename(index=name_by_code).reindex(index_names)
+            if index_bias is not None:
+                index_bias = index_bias.rename(index=name_by_code).reindex(index_names)
         portfolio = None
+        portfolio_nav_file = config.review.get("portfolio_nav_file")
         portfolio_file = config.review.get("portfolio_file")
-        if portfolio_file and Path(portfolio_file).exists():
+        if portfolio_nav_file and Path(portfolio_nav_file).exists():
+            portfolio = _read_review_nav(Path(portfolio_nav_file), review, "我的实盘合计")
+        elif portfolio_nav_file:
+            result.warnings.append(f"实盘净值文件不存在: {portfolio_nav_file}")
+        elif portfolio_file and Path(portfolio_file).exists():
             portfolio = portfolio_returns(market, pd.read_csv(portfolio_file, dtype=str), as_of)
+        elif portfolio_file:
+            result.warnings.append(f"实盘持仓文件不存在: {portfolio_file}")
         cb_summary = None
         incomplete_cb_dates = store.incomplete_market_snapshot_dates(
             AssetType.CONVERTIBLE_BOND, snapshot_dates
@@ -333,6 +381,23 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
             )
             if not cb_bars.empty:
                 cb_summary = asset_return_summary(cb_bars, as_of)
+        underlying_summary = None
+        underlying_file = config.review.get("convertible_underlyings_file")
+        if underlying_file and Path(underlying_file).exists():
+            underlying_symbols = _read_review_symbols(Path(underlying_file))
+            underlying_bars = market[market["symbol"].astype(str).isin(underlying_symbols)]
+            if not underlying_bars.empty:
+                underlying_summary = asset_return_summary(underlying_bars, as_of)
+        elif underlying_file:
+            result.warnings.append(f"可转债正股映射文件不存在: {underlying_file}")
+        microcap_returns = None
+        microcap_nav_file = config.review.get("microcap_nav_file")
+        if microcap_nav_file and Path(microcap_nav_file).exists():
+            microcap_returns = _read_review_nav(
+                Path(microcap_nav_file), review, "微盘股（自建等权）"
+            )
+        elif microcap_nav_file:
+            result.warnings.append(f"微盘股净值文件不存在: {microcap_nav_file}")
         bias = None
         if bias_codes:
             bias_bars = store.read_daily(
@@ -351,8 +416,11 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
                 review,
                 stage / "reviews",
                 index_returns=index_ret,
+                index_bias=index_bias,
                 portfolio=portfolio,
                 convertible_summary=cb_summary,
+                underlying_summary=underlying_summary,
+                microcap_returns=microcap_returns,
                 bias=bias,
             )
             staged_signals: dict[str, dict[str, Path]] = {}

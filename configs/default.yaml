@@ -91,8 +91,18 @@ strategies:
 review:
   indices:
     上证指数: 000001.SH
+    上证50: 000016.SH
     沪深300: 000300.SH
     中证500: 000905.SH
     中证1000: 000852.SH
+    中证2000: 932000.CSI
     创业板指: 399006.SZ
+    中证全指: 000985.CSI
+    科创50: 000688.SH
+    北证50: 899050.BJ
+  # 以下文件按需配置；未提供时汇总表保留对应空白行，不伪造数据。
+  # convertible_underlyings_file: configs/convertible_underlyings.csv
+  # microcap_nav_file: data/manual/microcap_nav.csv
+  # portfolio_nav_file: data/manual/portfolio_nav.csv
+  # portfolio_file: configs/portfolio.csv
   bias_ema_window: 20

@@ -173,7 +173,7 @@ def main() -> None:
             if standalone_date is None or standalone_date <= daily_generation["as_of"]:
                 review_files = daily_generation["review_files"]
         summary = review_files.get("summary")
-        breadth = review_files.get("csv")
+        breadth = review_files.get("daily_review") or review_files.get("csv")
         image = review_files.get("png")
         if summary:
             values = json.loads(summary.read_text(encoding="utf-8"))
