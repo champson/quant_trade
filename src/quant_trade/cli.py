@@ -14,6 +14,7 @@ import typer
 from quant_trade.config import load_config
 from quant_trade.data.minute_archive import MinuteArchiveImporter
 from quant_trade.data.minute_directory import MinuteDirectoryImporter
+from quant_trade.data.quality import DataQualityError
 from quant_trade.data.router import build_router
 from quant_trade.data.storage import DataStore
 from quant_trade.models import Adjustment, AssetType
@@ -79,10 +80,11 @@ def data_update(
         raise typer.BadParameter("全市场快照只支持 adjustment=none", param_hint="--adjustment")
     if not codes and asset_type not in {
         AssetType.STOCK,
+        AssetType.ETF,
         AssetType.CONVERTIBLE_BOND,
     }:
         raise typer.BadParameter(
-            "全市场快照只支持 stock 或 convertible_bond", param_hint="--asset-type"
+            "全市场快照只支持 stock、etf 或 convertible_bond", param_hint="--asset-type"
         )
     if not codes and start_date != end_date:
         raise typer.BadParameter(
@@ -124,22 +126,35 @@ def market_history(
     try:
         days = trading_days(router, start_date, end_date, store)
 
-        def progress(index: int, total: int, trade_date: date, rows: int) -> None:
-            typer.echo(f"[{index}/{total}] {trade_date} {rows:,} 行")
+        failures = []
+        total_rows = 0
+        for configured_asset in cfg.providers.full_market_asset_types:
+            asset = AssetType(configured_asset)
+            typer.echo(f"\n[{asset.value}] 开始处理 {len(days)} 个交易日")
 
-        def on_error(dataset: str, trade_date: date, exc: Exception) -> None:
-            typer.echo(f"[警告] {trade_date} {dataset}失败: {exc}", err=True)
+            def progress(index: int, total: int, trade_date: date, rows: int) -> None:
+                typer.echo(f"[{asset.value} {index}/{total}] {trade_date} {rows:,} 行")
 
-        update_market_history(
-            cfg,
-            router,
-            store,
-            days,
-            include_basic=include_basic,
-            force=force,
-            progress=progress,
-            on_error=on_error,
-        )
+            def on_error(dataset: str, trade_date: date, exc: Exception) -> None:
+                typer.echo(f"[警告] {asset.value} {trade_date} {dataset}失败: {exc}", err=True)
+
+            try:
+                total_rows += update_market_history(
+                    cfg,
+                    router,
+                    store,
+                    days,
+                    asset_type=asset,
+                    include_basic=include_basic,
+                    force=force,
+                    progress=progress,
+                    on_error=on_error,
+                )
+            except DataQualityError as exc:
+                failures.append(f"{asset.value}: {exc}")
+        if failures:
+            raise DataQualityError("；".join(failures))
+        typer.echo(f"完成：新增/更新 {total_rows:,} 行")
     finally:
         router.close()
 

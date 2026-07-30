@@ -15,6 +15,7 @@ from quant_trade.data.base import EmptyDataError, ProviderError
 from quant_trade.data.quality import DataQualityError
 from quant_trade.data.router import DataRouter
 from quant_trade.data.storage import DataStore
+from quant_trade.data.symbols import is_b_share_symbol
 from quant_trade.models import Adjustment, AssetType, DataRequest, Dataset, Frequency
 from quant_trade.strategies import get_strategy
 from quant_trade.strategies.base import SignalResult
@@ -65,8 +66,9 @@ def _record_market_snapshot(
     basic_verified = (
         store.daily_basic_complete(trade_date) if asset_type == AssetType.STOCK else False
     )
-    basic_count = store.daily_basic_symbol_count(trade_date) if asset_type == AssetType.STOCK else 0
-    basic_symbols = store.daily_basic_symbols(trade_date) if basic_verified else set()
+    stored_basic_symbols = store.daily_basic_symbols(trade_date) if basic_verified else set()
+    basic_symbols = {symbol for symbol in stored_basic_symbols if not is_b_share_symbol(symbol)}
+    basic_count = len(basic_symbols)
     missing_basic_symbols = sorted(basic_symbols - snapshot_symbols)
     prior_count = store.latest_complete_snapshot_symbol_count(asset_type, mode, trade_date)
     ratio = config.providers.market_snapshot_reference_ratio
@@ -78,10 +80,19 @@ def _record_market_snapshot(
     response_complete = batch.metadata.get("full_market_response_complete")
     response_limit = int(batch.metadata.get("full_market_response_limit", 0))
     if response_complete is True:
-        # Tushare's single-date endpoint returns the whole result below its
-        # documented row limit. Suspended stocks intentionally have no daily
-        # bar, so the active security master is not an exact row-count target.
-        expected_symbols = basic_count if basic_verified else symbol_count
+        if asset_type == AssetType.STOCK:
+            # Suspended stocks intentionally have no daily bar, so the active
+            # security master is not an exact row-count target.
+            expected_symbols = basic_count if basic_verified else symbol_count
+        elif provider_expected:
+            # ETF responses also contain non-ETF funds. The provider filters
+            # against etf_basic, whose dated universe remains the independent
+            # completeness reference even when fund_daily is below its limit.
+            expected_symbols = provider_floor
+        elif prior_count:
+            expected_symbols = reference_floor
+        else:
+            expected_symbols = configured_min
     elif response_complete is False:
         # Hitting the source row limit means the response may be truncated.
         expected_symbols = max(provider_floor, response_limit + 1, symbol_count + 1)
@@ -120,6 +131,7 @@ def _record_market_snapshot(
             "reference_tolerance_symbols": tolerance,
             "full_market_response_complete": response_complete,
             "full_market_response_rows": batch.metadata.get("full_market_response_rows"),
+            "full_market_filtered_rows": batch.metadata.get("full_market_filtered_rows"),
             "full_market_response_limit": response_limit,
             "missing_daily_basic_symbols": len(missing_basic_symbols),
             "missing_daily_basic_examples": missing_basic_symbols[:10],
@@ -269,7 +281,15 @@ def update_daily_basic(
     reference_tolerance_symbols: int = 0,
 ) -> pd.DataFrame:
     previous_complete = store.daily_basic_complete(trade_date)
-    previous_symbols = store.daily_basic_symbols(trade_date) if previous_complete else set()
+    previous_symbols = (
+        {
+            symbol
+            for symbol in store.daily_basic_symbols(trade_date)
+            if not is_b_share_symbol(symbol)
+        }
+        if previous_complete
+        else set()
+    )
     batch = router.fetch(
         DataRequest(
             dataset=Dataset.DAILY_BASIC,
@@ -286,6 +306,10 @@ def update_daily_basic(
     if missing:
         raise DataQualityError("daily_basic 缺少字段: " + ", ".join(sorted(missing)))
     work["symbol"] = work["symbol"].astype("string").str.strip()
+    excluded_b_shares = int(work["symbol"].map(is_b_share_symbol).sum())
+    work = work[~work["symbol"].map(is_b_share_symbol)].copy()
+    if work.empty:
+        raise EmptyDataError("daily_basic 未返回 A 股记录")
     work["trade_date"] = pd.to_datetime(work["trade_date"].astype(str), errors="coerce")
     work["total_mv"] = pd.to_numeric(work["total_mv"], errors="coerce")
     invalid = (
@@ -343,7 +367,9 @@ def update_daily_basic(
             "reference_tolerance_symbols": reference_tolerance_symbols,
             "full_market_response_complete": response_complete,
             "full_market_response_rows": batch.metadata.get("full_market_response_rows"),
+            "full_market_filtered_rows": batch.metadata.get("full_market_filtered_rows"),
             "full_market_response_limit": response_limit,
+            "excluded_b_share_symbols": excluded_b_shares,
             "symbol_digest": store.symbol_digest(set(work["symbol"].astype(str))),
         },
     )
@@ -356,15 +382,17 @@ def update_market_history(
     store: DataStore,
     days: list[date],
     *,
+    asset_type: AssetType = AssetType.STOCK,
     include_basic: bool = True,
     force: bool = False,
     progress=None,
     on_error=None,
 ) -> int:
-    """Backfill full-market snapshots with bounded, multi-day storage merges."""
+    """Backfill one asset's full-market snapshots with bounded storage merges."""
+    include_basic = include_basic and asset_type == AssetType.STOCK
     pending = []
     total_rows = 0
-    incomplete_market = set(store.incomplete_market_snapshot_dates(AssetType.STOCK, days))
+    incomplete_market = set(store.incomplete_market_snapshot_dates(asset_type, days))
     complete_market = set(days) - incomplete_market
 
     def report_error(dataset: str, trade_date: date, exc: Exception) -> None:
@@ -375,14 +403,14 @@ def update_market_history(
         nonlocal total_rows
         if not pending:
             return
-        store.write_daily(pd.concat([batch.data for _, batch, _ in pending]), AssetType.STOCK)
+        store.write_daily(pd.concat([batch.data for _, batch, _ in pending]), asset_type)
         for trade_date, batch, existing_complete in pending:
             try:
                 _record_market_snapshot(
                     config,
                     store,
                     batch,
-                    AssetType.STOCK,
+                    asset_type,
                     trade_date,
                     Adjustment.NONE,
                     preserve_existing_complete=existing_complete,
@@ -419,7 +447,7 @@ def update_market_history(
                         start=trade_date,
                         end=trade_date,
                         frequency=Frequency.DAY,
-                        asset_type=AssetType.STOCK,
+                        asset_type=asset_type,
                         adjustment=Adjustment.NONE,
                     )
                 )
@@ -438,7 +466,7 @@ def update_market_history(
         # that have not yet reached the configured batch size.
         flush()
 
-    incomplete_market = store.incomplete_market_snapshot_dates(AssetType.STOCK, days)
+    incomplete_market = store.incomplete_market_snapshot_dates(asset_type, days)
     incomplete_basic = store.incomplete_daily_basic_dates(days) if include_basic else []
     if incomplete_market or incomplete_basic:
         parts = []

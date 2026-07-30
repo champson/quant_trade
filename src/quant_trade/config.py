@@ -29,6 +29,9 @@ class RetryConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     priority: list[str] = Field(default_factory=lambda: ["tushare", "baostock", "akshare"])
     allow_fallback: bool = True
+    full_market_asset_types: list[Literal["stock", "etf", "convertible_bond"]] = Field(
+        default_factory=lambda: ["stock", "etf", "convertible_bond"]
+    )
     calendar_mutable_ttl_hours: float = Field(default=24.0, ge=0)
     market_snapshot_min_symbols: dict[str, int] = Field(
         default_factory=lambda: {"stock": 4500, "convertible_bond": 250}
@@ -50,6 +53,15 @@ class ProvidersConfig(BaseModel):
             raise ValueError("providers.priority 不能为空")
         if len(value) != len(set(value)):
             raise ValueError("providers.priority 不能包含重复数据源")
+        return value
+
+    @field_validator("full_market_asset_types")
+    @classmethod
+    def validate_full_market_asset_types(cls, value: list[str]) -> list[str]:
+        if "stock" not in value:
+            raise ValueError("providers.full_market_asset_types 必须包含 stock")
+        if len(value) != len(set(value)):
+            raise ValueError("providers.full_market_asset_types 不能包含重复资产类型")
         return value
 
 

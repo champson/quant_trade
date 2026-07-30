@@ -263,6 +263,70 @@ def test_market_history_batches_daily_file_merges(app_config, monkeypatch):
     assert store.incomplete_market_snapshot_dates(AssetType.STOCK, days) == []
 
 
+def test_market_history_supports_etf_snapshots(app_config):
+    app_config.providers.market_snapshot_min_symbols = {"etf": 1}
+    days = [date(2024, 1, 8), date(2024, 1, 9)]
+    requests = []
+
+    class Router:
+        def fetch(self, request):
+            requests.append(request)
+            data = _rows("510300.SH", [pd.Timestamp(request.end)])
+            data["adjustment"] = "none"
+            return DataBatch(data, "market", request)
+
+    store = DataStore(app_config)
+
+    assert (
+        update_market_history(
+            app_config,
+            Router(),
+            store,
+            days,
+            asset_type=AssetType.ETF,
+            include_basic=True,
+        )
+        == 2
+    )
+    assert {request.asset_type for request in requests} == {AssetType.ETF}
+    assert store.incomplete_market_snapshot_dates(AssetType.ETF, days) == []
+    assert store.daily_path(AssetType.ETF, "510300.SH", "none").exists()
+
+
+def test_etf_full_response_still_requires_etf_master_floor(app_config):
+    app_config.providers.market_snapshot_reference_ratio = 1
+    app_config.providers.market_snapshot_reference_tolerance_symbols = 0
+    day = date(2024, 1, 8)
+
+    class Router:
+        def fetch(self, request):
+            data = pd.concat(
+                [
+                    _rows("510300.SH", [pd.Timestamp(day)]),
+                    _rows("159915.SZ", [pd.Timestamp(day)]),
+                ],
+                ignore_index=True,
+            )
+            data["adjustment"] = "none"
+            return DataBatch(
+                data,
+                "market",
+                request,
+                metadata={
+                    "expected_symbols": 3,
+                    "expected_symbols_source": "tushare.etf_basic",
+                    "full_market_response_complete": True,
+                    "full_market_response_rows": 2,
+                    "full_market_response_limit": 5000,
+                },
+            )
+
+    store = DataStore(app_config)
+    with pytest.raises(DataQualityError, match="至少需要 3"):
+        update_bars(app_config, Router(), store, [], day, day, AssetType.ETF)
+    assert not store.market_snapshot_complete(AssetType.ETF, day)
+
+
 def test_bulk_daily_write_merges_existing_files_and_refreshes_fingerprints(app_config):
     store = DataStore(app_config)
     symbols = [f"{index:06d}.SZ" for index in range(40)]
@@ -1066,6 +1130,58 @@ def test_bounded_full_market_response_must_cover_daily_basic_symbols(app_config)
     with pytest.raises(DataQualityError, match="缺少 1 个证券"):
         update_bars(app_config, Router(), store, [], day, day, AssetType.STOCK)
     assert not store.market_snapshot_complete(AssetType.STOCK, day)
+
+
+def test_a_share_snapshot_ignores_b_shares_in_existing_daily_basic(app_config):
+    day = date(2026, 6, 30)
+    store = DataStore(app_config)
+    store.write_daily_basic(
+        pd.DataFrame(
+            {
+                "symbol": ["000001.SZ", "200011.SZ", "201872.SZ", "900901.SH"],
+                "trade_date": [day, day, day, day],
+                "total_mv": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+    )
+    store.mark_daily_basic_snapshot(
+        day,
+        row_count=4,
+        symbol_count=4,
+        expected_symbols=4,
+        provider="basic",
+        status="complete",
+        details={
+            "symbol_digest": store.symbol_digest(
+                {"000001.SZ", "200011.SZ", "201872.SZ", "900901.SH"}
+            )
+        },
+    )
+
+    class Router:
+        def fetch(self, request):
+            data = _rows("000001.SZ", [pd.Timestamp(day)])
+            data["adjustment"] = "none"
+            return DataBatch(
+                data,
+                "market",
+                request,
+                metadata={
+                    "full_market_response_complete": True,
+                    "full_market_response_rows": 1,
+                    "full_market_response_limit": 6000,
+                },
+            )
+
+    update_bars(app_config, Router(), store, [], day, day, AssetType.STOCK)
+
+    assert store.market_snapshot_complete(AssetType.STOCK, day)
+    with store.connect() as con:
+        details = con.execute(
+            "SELECT details FROM market_snapshots WHERE asset_type = 'stock' AND trade_date = ?",
+            [day],
+        ).fetchone()[0]
+    assert '"daily_basic_symbols": 1' in details
 
 
 def test_cached_market_snapshot_promotes_new_daily_basic_validation(app_config):

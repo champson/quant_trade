@@ -13,18 +13,22 @@ from quant_trade.data.base import (
     TransientProviderError,
 )
 from quant_trade.data.providers.common import normalize_daily, ymd
+from quant_trade.data.symbols import is_b_share_symbol
 from quant_trade.models import Adjustment, AssetType, DataBatch, DataRequest, Dataset, Frequency
 
 
 class TushareProvider(DataProvider):
     name = "tushare"
     full_market_row_limit = 6000
+    etf_full_market_row_limit = 5000
 
     def __init__(self, interval_seconds: float = 0.5, secrets: Secrets | None = None):
         self.interval_seconds = interval_seconds
         self.secrets = secrets or Secrets()
         self._pro = None
         self._stock_master: pd.DataFrame | None = None
+        self._etf_master: pd.DataFrame | None = None
+        self._etf_master_error: str | None = None
         self._convertible_bond_master: pd.DataFrame | None = None
 
     def capabilities(self) -> set[Dataset]:
@@ -182,7 +186,9 @@ class TushareProvider(DataProvider):
             # ``delist_date`` is the effective delisting date, so the security
             # is no longer part of that day's tradable universe.
             active = listed.le(day) & (delisted.isna() | delisted.gt(day))
-            return int(master.loc[active, "ts_code"].nunique()), None
+            active_symbols = master.loc[active, "ts_code"].dropna().astype(str)
+            active_symbols = active_symbols[~active_symbols.map(is_b_share_symbol)]
+            return int(active_symbols.nunique()), None
         except Exception as exc:  # noqa: BLE001 - metadata failure must degrade to a warning
             return 0, f"证券主表参考获取失败: {exc}"
 
@@ -203,6 +209,56 @@ class TushareProvider(DataProvider):
             return int(master.loc[active, "ts_code"].nunique()), None
         except Exception as exc:  # noqa: BLE001 - metadata failure must degrade to a warning
             return 0, f"可转债主表参考获取失败: {exc}"
+
+    def _active_etf_symbols(self, pro, trade_date) -> tuple[set[str], str | None]:
+        """Return ETFs listed on the requested date for filtering and validation."""
+        if self._etf_master_error:
+            return set(), self._etf_master_error
+        try:
+            if self._etf_master is None:
+                frames = []
+                for status in ("L", "D", "P"):
+                    frame = pro.etf_basic(
+                        list_status=status,
+                        fields="ts_code,list_status,list_date",
+                    )
+                    if frame is not None and not frame.empty:
+                        frames.append(frame)
+                    time.sleep(self.interval_seconds)
+                self._etf_master = (
+                    pd.concat(frames, ignore_index=True).drop_duplicates("ts_code", keep="last")
+                    if frames
+                    else pd.DataFrame()
+                )
+            master = self._etf_master.copy()
+            delisted_etfs = master.get("list_status", pd.Series(dtype="string")).eq("D")
+            delist_dates_missing = "delist_date" not in master or (
+                delisted_etfs.any() and master.loc[delisted_etfs, "delist_date"].isna().all()
+            )
+            if not master.empty and delist_dates_missing:
+                fund_master = pro.fund_basic(market="E", fields="ts_code,list_date,delist_date")
+                time.sleep(self.interval_seconds)
+                if fund_master is not None and not fund_master.empty:
+                    dates = fund_master.drop_duplicates("ts_code", keep="last")
+                    master = master.drop(columns="delist_date", errors="ignore").merge(
+                        dates[["ts_code", "delist_date"]],
+                        on="ts_code",
+                        how="left",
+                        validate="one_to_one",
+                    )
+                    self._etf_master = master.copy()
+            required = {"ts_code", "list_date", "delist_date"}
+            if master.empty or not required <= set(master.columns):
+                self._etf_master_error = "Tushare etf_basic 返回空结果或缺少日期字段"
+                return set(), self._etf_master_error
+            day = pd.Timestamp(trade_date).normalize()
+            listed = pd.to_datetime(master["list_date"], errors="coerce")
+            delisted = pd.to_datetime(master["delist_date"], errors="coerce")
+            active = listed.le(day) & (delisted.isna() | delisted.gt(day))
+            return set(master.loc[active, "ts_code"].dropna().astype(str)), None
+        except Exception as exc:  # noqa: BLE001 - surface master failure through provider contract
+            self._etf_master_error = f"ETF 主表参考获取失败: {exc}"
+            return set(), self._etf_master_error
 
     def fetch(self, request: DataRequest) -> DataBatch:
         if not self.supports(request):
@@ -231,11 +287,15 @@ class TushareProvider(DataProvider):
             metadata: dict[str, int | str] = {}
             warnings: list[str] = []
             if not request.symbols:
+                raw_rows = len(df)
+                if "ts_code" in df:
+                    df = df[~df["ts_code"].astype(str).map(is_b_share_symbol)].copy()
                 expected, warning = self._expected_stock_symbols(pro, request.end)
                 metadata["expected_symbols"] = expected
                 metadata["expected_symbols_source"] = "tushare.stock_basic"
-                metadata["full_market_response_complete"] = len(df) < self.full_market_row_limit
-                metadata["full_market_response_rows"] = len(df)
+                metadata["full_market_response_complete"] = raw_rows < self.full_market_row_limit
+                metadata["full_market_response_rows"] = raw_rows
+                metadata["full_market_filtered_rows"] = len(df)
                 metadata["full_market_response_limit"] = self.full_market_row_limit
                 if warning:
                     warnings.append(warning)
@@ -257,16 +317,37 @@ class TushareProvider(DataProvider):
         frames = []
         normalized_suspensions = 0
         symbols = request.symbols
-        if not symbols and request.asset_type in {AssetType.STOCK, AssetType.CONVERTIBLE_BOND}:
+        if not symbols and request.asset_type in {
+            AssetType.STOCK,
+            AssetType.ETF,
+            AssetType.CONVERTIBLE_BOND,
+        }:
             if pd.Timestamp(request.start).date() != pd.Timestamp(request.end).date():
                 raise PermanentProviderError("Tushare 全市场接口只支持单个交易日")
-            raw = (
-                pro.daily(trade_date=ymd(request.end))
-                if request.asset_type == AssetType.STOCK
-                else pro.cb_daily(trade_date=ymd(request.end))
-            )
+            active_etfs: set[str] = set()
+            etf_master_warning = None
+            if request.asset_type == AssetType.STOCK:
+                raw = pro.daily(trade_date=ymd(request.end))
+            elif request.asset_type == AssetType.ETF:
+                active_etfs, etf_master_warning = self._active_etf_symbols(pro, request.end)
+                if etf_master_warning:
+                    raise PermanentProviderError(
+                        f"Tushare 无法确定 ETF 全市场范围: {etf_master_warning}"
+                    )
+                if not active_etfs:
+                    raise EmptyDataError("Tushare ETF 主表在请求日没有在市证券")
+                raw = pro.fund_daily(trade_date=ymd(request.end))
+            else:
+                raw = pro.cb_daily(trade_date=ymd(request.end))
             time.sleep(self.interval_seconds)
             raw_rows = len(raw) if raw is not None else 0
+            if request.asset_type == AssetType.STOCK and raw is not None and "ts_code" in raw:
+                raw = raw[~raw["ts_code"].astype(str).map(is_b_share_symbol)].copy()
+            if request.asset_type == AssetType.ETF:
+                if raw is None or "ts_code" not in raw:
+                    raise PermanentProviderError("Tushare ETF 全市场行情缺少 ts_code 字段")
+                raw = raw[raw["ts_code"].astype(str).isin(active_etfs)].copy()
+            filtered_rows = len(raw) if raw is not None else 0
             data = normalize_daily(
                 raw,
                 symbol="",
@@ -274,14 +355,17 @@ class TushareProvider(DataProvider):
                 columns={"ts_code": "symbol", "vol": "volume"},
                 adjustment=request.adjustment,
             )
-            if request.asset_type == AssetType.STOCK and len(data) != raw_rows:
+            if (
+                request.asset_type in {AssetType.STOCK, AssetType.ETF}
+                and len(data) != filtered_rows
+            ):
                 raise PermanentProviderError(
-                    f"Tushare 全市场行情规范化丢弃了 {raw_rows - len(data)} 条记录"
+                    f"Tushare 全市场行情规范化丢弃了 {filtered_rows - len(data)} 条记录"
                 )
             if request.asset_type == AssetType.CONVERTIBLE_BOND:
                 data = self._attach_convertible_bond_pre_close(raw, data)
                 data, normalized_suspensions = self._normalize_convertible_bond_suspensions(data)
-            if request.asset_type == AssetType.STOCK and data.empty:
+            if request.asset_type in {AssetType.STOCK, AssetType.ETF} and data.empty:
                 raise TransientProviderError("Tushare 全市场日线暂时返回空结果")
             if data.empty:
                 raise EmptyDataError("Tushare 返回空行情")
@@ -295,9 +379,21 @@ class TushareProvider(DataProvider):
                 metadata["expected_symbols_source"] = "tushare.stock_basic"
                 metadata["full_market_response_complete"] = raw_rows < self.full_market_row_limit
                 metadata["full_market_response_rows"] = raw_rows
+                metadata["full_market_filtered_rows"] = filtered_rows
                 metadata["full_market_response_limit"] = self.full_market_row_limit
                 if warning:
                     warnings.append(warning)
+            elif request.asset_type == AssetType.ETF:
+                metadata["expected_symbols"] = len(active_etfs)
+                metadata["expected_symbols_source"] = "tushare.etf_basic"
+                metadata["full_market_response_complete"] = (
+                    raw_rows < self.etf_full_market_row_limit
+                )
+                metadata["full_market_response_rows"] = raw_rows
+                metadata["full_market_filtered_rows"] = filtered_rows
+                metadata["full_market_response_limit"] = self.etf_full_market_row_limit
+                if etf_master_warning:
+                    warnings.append(etf_master_warning)
             elif request.asset_type == AssetType.CONVERTIBLE_BOND:
                 expected, warning = self._expected_convertible_bond_symbols(pro, request.end)
                 metadata["expected_symbols"] = expected

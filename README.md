@@ -52,7 +52,10 @@ ZIP 会拒绝坏行和与声明频率不符的时间点，先完整写入 stagin
 交易日历和明确的空行情日期缓存在 DuckDB，完整缓存更新可离线运行；部分成功响应遗漏的
 日期仍会继续补取。今天及未来的交易日历默认每24小时刷新；行情命令拒绝未来 `--end`。
 全市场 `data update` 只支持单日且仅支持 `adjustment=none`，历史回填使用
-`qt data market-history`。快照行数、证券成员、参考阈值和完整性状态写入 DuckDB；成员
+`qt data market-history`。默认按 `providers.full_market_asset_types` 下载 A 股、ETF 和可转债；
+可在自定义配置中缩减，但必须保留 `stock`。`qt daily run` 同样补齐复盘锚点上的三类快照，
+A 股失败会终止流水线，ETF 或可转债失败则保留警告并继续生成可用报告。快照行数、证券成员、
+参考阈值和完整性状态写入 DuckDB；成员
 Parquet 丢失、缺少目标交易日或响应未达到阈值时不会命中断点缓存。写入完成标记时对所有
 成员保存文件指纹，并按 `market_snapshot_validation_sample_size` 确定性抽检内容；之后的
 断点检查只比较指纹，并按 `market_snapshot_cache_ttl_seconds` 短暂记忆结果，不会反复打开

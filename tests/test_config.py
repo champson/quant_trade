@@ -3,12 +3,18 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from quant_trade.config import AppConfig, BacktestConfig, MinuteConfig, RetryConfig
+from quant_trade.config import AppConfig, BacktestConfig, MinuteConfig, ProvidersConfig, RetryConfig
 
 
 def test_retry_delays_cannot_be_negative():
     with pytest.raises(ValidationError):
         RetryConfig(delays=[-1])
+
+
+def test_full_market_assets_default_to_stock_etf_and_convertible_bond():
+    assert ProvidersConfig().full_market_asset_types == ["stock", "etf", "convertible_bond"]
+    with pytest.raises(ValidationError, match="必须包含 stock"):
+        ProvidersConfig(full_market_asset_types=["etf", "convertible_bond"])
 
 
 def test_backtest_rates_and_strategy_storage_contracts_are_validated():

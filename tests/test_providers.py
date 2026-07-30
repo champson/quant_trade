@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from quant_trade.data.base import TransientProviderError
+from quant_trade.data.base import PermanentProviderError, TransientProviderError
 from quant_trade.data.providers.akshare import AkShareProvider
 from quant_trade.data.providers.baostock import BaoStockProvider
 from quant_trade.data.providers.tushare import TushareProvider
@@ -33,7 +33,11 @@ class FakeTushareApi:
         assert exchange == ""
         assert "delist_date" in fields
         rows = {
-            "L": [("000001.SZ", "20100101", None), ("000002.SZ", "20150101", None)],
+            "L": [
+                ("000001.SZ", "20100101", None),
+                ("000002.SZ", "20150101", None),
+                ("200011.SZ", "20100101", None),
+            ],
             "D": [
                 ("000003.SZ", "20100101", "20191231"),
                 ("000005.SZ", "20100101", "20200102"),
@@ -55,9 +59,9 @@ class FakeTushareApi:
     def daily_basic(self, *, trade_date):
         return pd.DataFrame(
             {
-                "ts_code": ["000001.SZ", "000002.SZ"],
-                "trade_date": [trade_date, trade_date],
-                "total_mv": [100.0, 200.0],
+                "ts_code": ["000001.SZ", "000002.SZ", "200011.SZ"],
+                "trade_date": [trade_date, trade_date, trade_date],
+                "total_mv": [100.0, 200.0, 50.0],
             }
         )
 
@@ -78,6 +82,7 @@ def test_tushare_full_market_reports_independent_historical_universe_size():
     assert batch.metadata["expected_symbols_source"] == "tushare.stock_basic"
     assert batch.metadata["full_market_response_complete"] is True
     assert batch.metadata["full_market_response_rows"] == 2
+    assert batch.metadata["full_market_filtered_rows"] == 2
     assert batch.metadata["full_market_response_limit"] == 6000
     assert set(batch.data["symbol"]) == {"000001.SZ", "000002.SZ"}
 
@@ -96,7 +101,9 @@ def test_tushare_daily_basic_reports_independent_historical_universe_size():
     assert batch.metadata["expected_symbols"] == 3
     assert batch.metadata["expected_symbols_source"] == "tushare.stock_basic"
     assert batch.metadata["full_market_response_complete"] is True
-    assert batch.metadata["full_market_response_rows"] == 2
+    assert batch.metadata["full_market_response_rows"] == 3
+    assert batch.metadata["full_market_filtered_rows"] == 2
+    assert set(batch.data["ts_code"]) == {"000001.SZ", "000002.SZ"}
 
 
 @pytest.mark.parametrize("dataset", [Dataset.BARS, Dataset.DAILY_BASIC])
@@ -174,6 +181,105 @@ def test_tushare_etf_hfq_uses_dated_fund_adjustment_factor():
     assert batch.data["close"].tolist() == [2.0, 6.0]
     assert set(batch.data["adjustment"]) == {"hfq"}
     assert batch.metadata["adjustment_evidence"] == "tushare_dated_factor"
+
+
+def test_tushare_full_market_etf_filters_with_dated_etf_master():
+    class Api:
+        def etf_basic(self, *, list_status, fields):
+            assert fields == "ts_code,list_status,list_date"
+            rows = {
+                "L": [
+                    ("510300.SH", "20120101", None),
+                    ("159915.SZ", "20150101", None),
+                ],
+                "D": [
+                    ("510001.SH", "20100101", "20191231"),
+                    ("510002.SH", "20100101", "20200102"),
+                ],
+                "P": [("510003.SH", "20210101", None)],
+            }[list_status]
+            return pd.DataFrame(
+                [
+                    {
+                        "ts_code": symbol,
+                        "list_status": list_status,
+                        "list_date": listed,
+                    }
+                    for symbol, listed, delisted in rows
+                ]
+            )
+
+        def fund_basic(self, *, market, fields):
+            assert market == "E"
+            assert "delist_date" in fields
+            return pd.DataFrame(
+                {
+                    "ts_code": [
+                        "510300.SH",
+                        "159915.SZ",
+                        "510001.SH",
+                        "510002.SH",
+                        "510003.SH",
+                    ],
+                    "list_date": ["20120101", "20150101", "20100101", "20100101", "20210101"],
+                    "delist_date": [None, None, "20191231", "20200102", None],
+                }
+            )
+
+        def fund_daily(self, *, trade_date):
+            assert trade_date == "20200102"
+            return pd.DataFrame(
+                {
+                    "ts_code": ["510300.SH", "159915.SZ", "160001.SZ"],
+                    "trade_date": [trade_date] * 3,
+                    "open": [4.0, 2.0, 1.0],
+                    "high": [4.1, 2.1, 1.1],
+                    "low": [3.9, 1.9, 0.9],
+                    "close": [4.0, 2.0, 1.0],
+                    "vol": [100, 200, 300],
+                    "amount": [400, 400, 300],
+                }
+            )
+
+    provider = TushareProvider(interval_seconds=0)
+    provider._pro = Api()
+    request = DataRequest(
+        dataset=Dataset.BARS,
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        asset_type=AssetType.ETF,
+    )
+
+    batch = provider.fetch(request)
+
+    assert set(batch.data["symbol"]) == {"510300.SH", "159915.SZ"}
+    assert batch.metadata["expected_symbols"] == 2
+    assert batch.metadata["expected_symbols_source"] == "tushare.etf_basic"
+    assert batch.metadata["full_market_response_complete"] is True
+    assert batch.metadata["full_market_response_rows"] == 3
+    assert batch.metadata["full_market_filtered_rows"] == 2
+    assert batch.metadata["full_market_response_limit"] == 5000
+
+
+def test_tushare_full_market_etf_rejects_missing_etf_master():
+    class Api:
+        def etf_basic(self, **kwargs):
+            raise RuntimeError("permission denied")
+
+        def fund_daily(self, **kwargs):
+            raise AssertionError("must not fetch an unfilterable fund universe")
+
+    provider = TushareProvider(interval_seconds=0)
+    provider._pro = Api()
+    request = DataRequest(
+        dataset=Dataset.BARS,
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+        asset_type=AssetType.ETF,
+    )
+
+    with pytest.raises(PermanentProviderError, match="无法确定 ETF 全市场范围"):
+        provider.fetch(request)
 
 
 def test_tushare_normalizes_suspended_convertible_bond_placeholder():

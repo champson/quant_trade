@@ -251,12 +251,20 @@ def run_daily(config: AppConfig, router: DataRouter, store: DataStore, as_of: da
                 raise DataQualityError(
                     f"{snapshot} daily_basic 不完整：{basic_count} 个证券，至少需要 {expected}"
                 )
-            try:
-                update_bars(
-                    config, router, store, [], snapshot, snapshot, AssetType.CONVERTIBLE_BOND
-                )
-            except (EmptyDataError, ProviderError, DataQualityError) as exc:
-                result.warnings.append(f"可转债快照失败 {snapshot}: {exc}")
+            optional_names = {
+                AssetType.ETF: "ETF",
+                AssetType.CONVERTIBLE_BOND: "可转债",
+            }
+            for configured_asset in config.providers.full_market_asset_types:
+                asset_type = AssetType(configured_asset)
+                if asset_type == AssetType.STOCK:
+                    continue
+                try:
+                    update_bars(config, router, store, [], snapshot, snapshot, asset_type)
+                except (EmptyDataError, ProviderError, DataQualityError) as exc:
+                    result.warnings.append(
+                        f"{optional_names[asset_type]}快照失败 {snapshot}: {exc}"
+                    )
 
         index_codes = list((config.review.get("indices") or {}).values())
         bias_file = config.review.get("bias_symbols_file")

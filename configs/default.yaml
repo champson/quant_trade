@@ -7,6 +7,8 @@ paths:
 providers:
   priority: [tushare, baostock, akshare]
   allow_fallback: true
+  # market-history 和 daily run 默认下载的全市场未复权日线
+  full_market_asset_types: [stock, etf, convertible_bond]
   calendar_mutable_ttl_hours: 24
   market_snapshot_min_symbols:
     stock: 4500

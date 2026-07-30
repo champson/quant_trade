@@ -23,10 +23,14 @@ from quant_trade.pipelines.daily import (
 class OfflineMarketProvider(DataProvider):
     name = "offline"
 
+    def __init__(self):
+        self.requests = []
+
     def capabilities(self):
         return {Dataset.BARS, Dataset.TRADE_CALENDAR}
 
     def fetch(self, request):
+        self.requests.append(request)
         if request.dataset == Dataset.TRADE_CALENDAR:
             dates = pd.date_range(request.start, request.end, freq="D")
             return DataBatch(
@@ -76,12 +80,17 @@ def test_review_anchors_require_previous_complete_trading_day():
 
 
 def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
-    app_config.providers.market_snapshot_min_symbols = {"stock": 2, "convertible_bond": 2}
+    app_config.providers.market_snapshot_min_symbols = {
+        "stock": 2,
+        "etf": 2,
+        "convertible_bond": 2,
+    }
     app_config.review = {"indices": {}}
     app_config.strategies = {}
     app_config.providers.priority = ["offline"]
     store = DataStore(app_config)
-    router = DataRouter(app_config, {"offline": OfflineMarketProvider()}, store)
+    provider = OfflineMarketProvider()
+    router = DataRouter(app_config, {"offline": provider}, store)
     monkeypatch.setattr("quant_trade.pipelines.daily.notify", lambda *_: None)
     result = run_daily(app_config, router, store, date(2024, 1, 8))
     assert result.as_of == date(2024, 1, 8)
@@ -91,6 +100,16 @@ def test_daily_pipeline_runs_offline_and_writes_review(app_config, monkeypatch):
     generation = _latest_daily_generation(app_config.paths.artifacts_dir)
     assert generation is not None
     assert generation["as_of"] == pd.Timestamp("2024-01-08")
+    full_market_assets = {
+        request.asset_type
+        for request in provider.requests
+        if request.dataset == Dataset.BARS and not request.symbols
+    }
+    assert full_market_assets == {
+        AssetType.STOCK,
+        AssetType.ETF,
+        AssetType.CONVERTIBLE_BOND,
+    }
     with store.connect() as con:
         status = con.execute("SELECT status FROM runs").fetchone()[0]
     assert status == "success"

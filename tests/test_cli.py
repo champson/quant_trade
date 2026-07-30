@@ -64,6 +64,36 @@ def test_market_history_and_daily_reject_future_dates_before_runtime():
     assert "不支持请求未来行情日期" in daily.output
 
 
+def test_market_history_downloads_all_configured_full_market_assets(app_config, monkeypatch):
+    requested_assets = []
+
+    class Router:
+        def close(self):
+            return None
+
+    monkeypatch.setattr("quant_trade.cli._runtime", lambda _: (app_config, object(), Router()))
+    monkeypatch.setattr("quant_trade.cli.trading_days", lambda *_: [date(2024, 1, 8)])
+
+    def update(*_args, asset_type, **_kwargs):
+        requested_assets.append(asset_type)
+        return 1
+
+    monkeypatch.setattr("quant_trade.cli.update_market_history", update)
+
+    result = runner.invoke(
+        app,
+        ["data", "market-history", "--start", "2024-01-08", "--end", "2024-01-08"],
+    )
+
+    assert result.exit_code == 0
+    assert requested_assets == [
+        AssetType.STOCK,
+        AssetType.ETF,
+        AssetType.CONVERTIBLE_BOND,
+    ]
+    assert "新增/更新 3 行" in result.output
+
+
 def test_review_close_requires_complete_target_and_anchor_snapshots(app_config, monkeypatch):
     monkeypatch.setattr("quant_trade.cli.load_config", lambda _: app_config)
     store = DataStore(app_config)
