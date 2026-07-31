@@ -131,6 +131,22 @@ class DataStore:
                     provider VARCHAR, status VARCHAR, checked_at TIMESTAMP,
                     details VARCHAR
                 );
+                CREATE TABLE IF NOT EXISTS review_notes (
+                    trade_date DATE PRIMARY KEY,
+                    headline VARCHAR,
+                    market_state VARCHAR,
+                    sentiment_score INTEGER,
+                    discipline_score INTEGER,
+                    position_pct DOUBLE,
+                    portfolio_return DOUBLE,
+                    market_observation VARCHAR,
+                    trade_review VARCHAR,
+                    lessons VARCHAR,
+                    next_plan VARCHAR,
+                    tags VARCHAR,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS minute_commit_log (
                     commit_id VARCHAR PRIMARY KEY, status VARCHAR,
                     created_at TIMESTAMP, updated_at TIMESTAMP
@@ -153,6 +169,149 @@ class DataStore:
                 ALTER TABLE market_snapshot_members ADD COLUMN IF NOT EXISTS file_mtime_ns BIGINT;
                 """
             )
+
+    @staticmethod
+    def _normalize_review_note(values: dict[str, Any]) -> dict[str, Any]:
+        sentiment_score = int(values.get("sentiment_score", 3))
+        discipline_score = int(values.get("discipline_score", 3))
+        if sentiment_score not in range(1, 6):
+            raise ValueError("市场体感评分必须在 1 到 5 之间")
+        if discipline_score not in range(1, 6):
+            raise ValueError("执行纪律评分必须在 1 到 5 之间")
+        position_pct = float(values.get("position_pct", 0))
+        if not 0 <= position_pct <= 1:
+            raise ValueError("仓位比例必须在 0 到 1 之间")
+        portfolio_return = float(values.get("portfolio_return", 0))
+        if not np.isfinite(portfolio_return):
+            raise ValueError("实盘收益必须是有限数值")
+        tags_value = values.get("tags", [])
+        if isinstance(tags_value, str):
+            tags = [item.strip() for item in tags_value.split(",") if item.strip()]
+        else:
+            tags = [str(item).strip() for item in tags_value if str(item).strip()]
+        return {
+            "headline": str(values.get("headline", "")).strip(),
+            "market_state": str(values.get("market_state", "")).strip(),
+            "sentiment_score": sentiment_score,
+            "discipline_score": discipline_score,
+            "position_pct": position_pct,
+            "portfolio_return": portfolio_return,
+            "market_observation": str(values.get("market_observation", "")).strip(),
+            "trade_review": str(values.get("trade_review", "")).strip(),
+            "lessons": str(values.get("lessons", "")).strip(),
+            "next_plan": str(values.get("next_plan", "")).strip(),
+            "tags": list(dict.fromkeys(tags)),
+        }
+
+    def save_review_note(self, trade_date: date | str, values: dict[str, Any]) -> dict[str, Any]:
+        """Create or update the manual review note for one calendar day."""
+        day = pd.Timestamp(trade_date).date()
+        note = self._normalize_review_note(values)
+        now = datetime.now()
+        with self.connect() as con:
+            existing = con.execute(
+                "SELECT created_at FROM review_notes WHERE trade_date = ?", [day]
+            ).fetchone()
+            created_at = existing[0] if existing else now
+            con.execute(
+                """
+                INSERT OR REPLACE INTO review_notes
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    day,
+                    note["headline"],
+                    note["market_state"],
+                    note["sentiment_score"],
+                    note["discipline_score"],
+                    note["position_pct"],
+                    note["portfolio_return"],
+                    note["market_observation"],
+                    note["trade_review"],
+                    note["lessons"],
+                    note["next_plan"],
+                    json.dumps(note["tags"], ensure_ascii=False),
+                    created_at,
+                    now,
+                ],
+            )
+        saved = self.review_note(day)
+        assert saved is not None
+        return saved
+
+    def review_note(self, trade_date: date | str) -> dict[str, Any] | None:
+        day = pd.Timestamp(trade_date).date()
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT trade_date, headline, market_state, sentiment_score,
+                       discipline_score, position_pct, portfolio_return,
+                       market_observation, trade_review, lessons, next_plan,
+                       tags, created_at, updated_at
+                FROM review_notes WHERE trade_date = ?
+                """,
+                [day],
+            ).fetchone()
+        if row is None:
+            return None
+        columns = [
+            "trade_date",
+            "headline",
+            "market_state",
+            "sentiment_score",
+            "discipline_score",
+            "position_pct",
+            "portfolio_return",
+            "market_observation",
+            "trade_review",
+            "lessons",
+            "next_plan",
+            "tags",
+            "created_at",
+            "updated_at",
+        ]
+        result = dict(zip(columns, row, strict=True))
+        try:
+            result["tags"] = json.loads(result["tags"] or "[]")
+        except (TypeError, ValueError):
+            result["tags"] = []
+        return result
+
+    def list_review_notes(
+        self,
+        *,
+        start: date | str | None = None,
+        end: date | str | None = None,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        clauses = []
+        parameters: list[Any] = []
+        if start is not None:
+            clauses.append("trade_date >= ?")
+            parameters.append(pd.Timestamp(start).date())
+        if end is not None:
+            clauses.append("trade_date <= ?")
+            parameters.append(pd.Timestamp(end).date())
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("limit 必须大于 0")
+            limit_sql = " LIMIT ?"
+            parameters.append(limit)
+        with self.connect() as con:
+            return con.execute(
+                """
+                SELECT trade_date, headline, market_state, sentiment_score,
+                       discipline_score, position_pct, portfolio_return,
+                       tags, updated_at
+                FROM review_notes
+                """
+                + where
+                + " ORDER BY trade_date DESC"
+                + limit_sql,
+                parameters,
+            ).df()
 
     @contextmanager
     def minute_write_lock(self):

@@ -79,6 +79,9 @@ BIAS25”汇总 A 股数量/涨跌分布、均值与中位数、宽基指数、�
 微盘股和实盘的真实收益优先读取 `review.microcap_nav_file`、
 `review.portfolio_nav_file`，净值 CSV 需包含日期列 `trade_date/date/日期` 之一及数值列
 `nav/equity/净值/总资产` 之一。未配置的数据行留空，不使用替代数据冒充。
+`qt dashboard` 的“复盘中心”可按已发布日期查看历史复盘，并在同一日期上下文中手工记录
+市场状态、主观体感、执行纪律、仓位、实盘收益、观察、交易回顾、经验和次日计划。记录按
+日期写入 DuckDB `review_notes`，可重复编辑、查看档案并导出 CSV，不依赖浏览器会话保存。
 
 每次回测会在 `artifacts/backtests/<策略名>/<运行编号>/` 同时生成自包含的
 `report.html`、可归档的 `report.md`、净值与月度图表，以及权益、持仓、成交和指标明细，
